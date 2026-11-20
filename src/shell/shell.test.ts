@@ -105,6 +105,45 @@ describe("Bun-compatible Shell ($)", () => {
   });
 });
 
+describe("child_process sandboxing", () => {
+  test("module-level APIs cannot spawn host executables", () => {
+    const res = exec("/bin/echo free_escape");
+    expect(res.exitCode).toBe(126);
+    expect(res.stdout.toString()).toBe("");
+    expect(() => execSync("/bin/echo free_escape")).toThrow();
+  });
+
+  test("Shell child_process methods inherit the shell allowlist", () => {
+    const shell = new Shell({ allowHostExecutables: { pod: "/bin/echo" } });
+    expect(shell.exec("pod instance_exec").stdout.toString().trim()).toBe(
+      "instance_exec",
+    );
+    expect(shell.execSync("pod instance_sync").toString().trim()).toBe(
+      "instance_sync",
+    );
+    expect(
+      shell.execFile("pod", ["instance_file"]).stdout.toString().trim(),
+    ).toBe("instance_file");
+    expect(
+      shell.execFileSync("pod", ["instance_file_sync"]).toString().trim(),
+    ).toBe("instance_file_sync");
+    expect(shell.spawn("pod", ["instance_spawn"]).stdout.toString().trim()).toBe(
+      "instance_spawn",
+    );
+    expect(
+      shell.spawnSync("pod", ["instance_spawn_sync"]).stdout.toString().trim(),
+    ).toBe("instance_spawn_sync");
+  });
+
+  test("Shell child_process methods deny non-allowlisted executables", () => {
+    const shell = new Shell();
+    const res = shell.exec("/bin/echo escape");
+    expect(res.exitCode).toBe(126);
+    expect(res.stdout.toString()).toBe("");
+    expect(() => shell.execSync("/bin/echo escape")).toThrow();
+  });
+});
+
 describe("node:child_process alias APIs", () => {
   test("exec runs shell command", async () => {
     const res = await exec("echo child_process_exec");
