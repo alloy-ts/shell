@@ -1,5 +1,6 @@
+import { dirname, join } from "node:path";
 import {
-  Shell,
+  Shell as NapiShell,
   type ShellOpts,
   type ShellPromiseResult,
   braces,
@@ -12,6 +13,19 @@ import {
   spawnSync as napiSpawnSync,
 } from "../../../dist/index.mjs";
 
+/**
+ * Default host-executable allowlist: only `node` and `npm` are permitted.
+ * Paths are absolute — node comes from the `process` global (`process.execPath`)
+ * and npm is resolved as its sibling in the same directory.
+ */
+export const defaultAllowHostExecutables: Record<string, string> = {
+  node: process.execPath,
+  npm: join(
+    dirname(process.execPath),
+    process.platform === "win32" ? "npm.cmd" : "npm",
+  ),
+};
+
 export interface ShellPromise extends Promise<ShellPromiseResult> {
   text(): Promise<string>;
   json<T = any>(): Promise<T>;
@@ -22,11 +36,27 @@ export interface ShellPromise extends Promise<ShellPromiseResult> {
   throws(throwOnError: boolean): ShellPromise;
   env(variables: Record<string, string>): ShellPromise;
   cwd(directory: string): ShellPromise;
-  executableAliases(aliases: Record<string, string>): ShellPromise;
+  allowHostExecutables(allowlist: Record<string, string>): ShellPromise;
 }
 
 /** @deprecated Use `ShellOpts` instead. */
 export type ShellConfig = ShellOpts;
+
+/**
+ * Wrapper over the napi `Shell` that applies the default host-executable
+ * allowlist (node + npm) whenever the caller does not pass one explicitly.
+ * An explicit `allowHostExecutables` — including `{}` to deny all host
+ * executables — always wins.
+ */
+class ShellWithDefaults extends NapiShell {
+  constructor(opts?: ShellOpts) {
+    super({
+      ...opts,
+      allowHostExecutables:
+        opts?.allowHostExecutables ?? defaultAllowHostExecutables,
+    });
+  }
+}
 
 export class ShellCommandPromise implements ShellPromise {
   private _promise?: Promise<ShellPromiseResult>;
@@ -93,10 +123,10 @@ export class ShellCommandPromise implements ShellPromise {
     return this;
   }
 
-  executableAliases(aliases: Record<string, string>): this {
-    this._localCfg.executableAliases = {
-      ...this._localCfg.executableAliases,
-      ...aliases,
+  allowHostExecutables(allowlist: Record<string, string>): this {
+    this._localCfg.allowHostExecutables = {
+      ...this._localCfg.allowHostExecutables,
+      ...allowlist,
     };
     return this;
   }
@@ -132,7 +162,7 @@ export class ShellCommandPromise implements ShellPromise {
   readonly [Symbol.toStringTag] = "ShellCommandPromise";
 }
 
-const defaultShell = new Shell();
+const defaultShell = new ShellWithDefaults();
 
 export interface ShellFunction {
   (strings: TemplateStringsArray | string, ...values: any[]): ShellCommandPromise;
@@ -140,7 +170,7 @@ export interface ShellFunction {
   env(variables?: Record<string, string>): Record<string, string> | null;
   nothrow(): void;
   throws(throwOnError: boolean): void;
-  executableAliases(aliases?: Record<string, string>): Record<string, string> | null;
+  allowHostExecutables(allowlist?: Record<string, string>): Record<string, string> | null;
   braces(pattern: string): string[];
   escape(s: string): string;
 }
@@ -178,8 +208,8 @@ $.cwd = (path?: string) => defaultShell.cwd(path);
 $.env = (variables?: Record<string, string>) => defaultShell.env(variables);
 $.nothrow = () => defaultShell.nothrow();
 $.throws = (throwOnError: boolean) => defaultShell.throws(throwOnError);
-$.executableAliases = (aliases?: Record<string, string>) =>
-  defaultShell.executableAliases(aliases);
+$.allowHostExecutables = (allowlist?: Record<string, string>) =>
+  defaultShell.allowHostExecutables(allowlist);
 $.braces = (pattern: string) => braces(pattern);
 $.escape = (s: string) => escape(s);
 
@@ -191,5 +221,5 @@ export const execFileSync = napiExecFileSync;
 export const spawn = napiSpawn;
 export const spawnSync = napiSpawnSync;
 
-export { Shell, braces, escape };
+export { ShellWithDefaults as Shell, braces, escape };
 export type { ShellOpts, ShellPromiseResult };
