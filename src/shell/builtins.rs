@@ -1,6 +1,6 @@
 //! Built-in commands implementation for Bun-compatible shell.
 //! Cross-platform native implementations:
-//! echo, pwd, cd, ls, rm, cat, touch, mkdir, which, mv, exit, true, false, yes, seq, dirname, basename.
+//! echo, pwd, cd, ls, rm, cp, cat, touch, mkdir, which, mv, exit, true, false, yes, seq, dirname, basename.
 
 use std::fs;
 use std::path::{Component, Path, PathBuf};
@@ -87,6 +87,7 @@ pub fn is_builtin(name: &str) -> bool {
                 | "cd"
                 | "ls"
                 | "rm"
+                | "cp"
                 | "cat"
                 | "grep"
                 | "wc"
@@ -126,6 +127,7 @@ pub fn run_builtin(
         "cd" => Some(builtin_cd(args, cwd)),
         "ls" => Some(builtin_ls(args, cwd)),
         "rm" => Some(builtin_rm(args, cwd)),
+        "cp" => Some(builtin_cp(args, cwd)),
         "cat" => Some(builtin_cat(args, stdin_data, cwd)),
         "grep" => Some(builtin_grep(args, stdin_data, cwd)),
         "wc" => Some(builtin_wc(args, stdin_data, cwd)),
@@ -623,11 +625,7 @@ fn builtin_grep(args: &[String], stdin_data: &[u8], cwd: &Path) -> BuiltinResult
         } else {
             line.contains(&pat)
         };
-        if invert_match {
-            !matched
-        } else {
-            matched
-        }
+        if invert_match { !matched } else { matched }
     };
 
     let mut stdout = Vec::new();
@@ -801,7 +799,9 @@ fn builtin_wc(args: &[String], stdin_data: &[u8], cwd: &Path) -> BuiltinResult {
             match fs::read(&path) {
                 Ok(data) => {
                     let (l, w, b) = compute_stats(&data);
-                    stdout.extend_from_slice(format!("{}\n", format_counts(l, w, b, file)).as_bytes());
+                    stdout.extend_from_slice(
+                        format!("{}\n", format_counts(l, w, b, file)).as_bytes(),
+                    );
                 }
                 Err(e) => {
                     exit_code = 1;
@@ -827,7 +827,12 @@ fn builtin_touch(args: &[String], cwd: &Path) -> BuiltinResult {
             Ok(p) => p,
             Err(_) => return path_denied("touch", arg),
         };
-        if let Err(e) = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path) {
+        if let Err(e) = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+        {
             exit_code = 1;
             stderr.extend_from_slice(format!("touch: {}: {}\n", path.display(), e).as_bytes());
         }
@@ -883,8 +888,8 @@ fn builtin_which(args: &[String]) -> BuiltinResult {
     let mut stderr = Vec::new();
     let mut exit_code = 0;
 
-    let path_var = std::env::var("PATH").unwrap_or_default();
-    let dirs: Vec<&str> = path_var.split(':').collect();
+    let path_var = std::env::var_os("PATH").unwrap_or_default();
+    let dirs: Vec<_> = std::env::split_paths(&path_var).collect();
 
     for arg in args {
         let mut found = false;
@@ -906,6 +911,51 @@ fn builtin_which(args: &[String]) -> BuiltinResult {
     BuiltinResult {
         exit_code,
         stdout,
+        stderr,
+    }
+}
+
+fn builtin_cp(args: &[String], cwd: &Path) -> BuiltinResult {
+    if args.len() < 2 {
+        return BuiltinResult {
+            exit_code: 1,
+            stdout: Vec::new(),
+            stderr: b"cp: missing destination file operand\n".to_vec(),
+        };
+    }
+    let dest = match confined_path(cwd, args.last().unwrap()) {
+        Ok(path) => path,
+        Err(_) => return path_denied("cp", args.last().unwrap()),
+    };
+    if args.len() > 2 && !dest.is_dir() {
+        return BuiltinResult {
+            exit_code: 1,
+            stdout: Vec::new(),
+            stderr: b"cp: target is not a directory\n".to_vec(),
+        };
+    }
+    let mut stderr = Vec::new();
+    for source in &args[..args.len() - 1] {
+        let src = match confined_path(cwd, source) {
+            Ok(path) => path,
+            Err(_) => return path_denied("cp", source),
+        };
+        let target = if dest.is_dir() {
+            dest.join(src.file_name().unwrap_or_default())
+        } else {
+            dest.clone()
+        };
+        if !src.is_file() {
+            stderr.extend_from_slice(
+                format!("cp: {}: not a regular file\n", src.display()).as_bytes(),
+            );
+        } else if let Err(err) = fs::copy(&src, &target) {
+            stderr.extend_from_slice(format!("cp: {}: {err}\n", src.display()).as_bytes());
+        }
+    }
+    BuiltinResult {
+        exit_code: i32::from(!stderr.is_empty()),
+        stdout: Vec::new(),
         stderr,
     }
 }
@@ -1089,7 +1139,8 @@ mod tests {
     use super::*;
 
     fn temp_root(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("shell-confine-{}-{}", tag, std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("shell-confine-{}-{}", tag, std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir

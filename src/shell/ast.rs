@@ -16,16 +16,18 @@ pub enum RedirectOp {
     BothTruncate,
     /// `&>> filename`
     BothAppend,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Redirection {
+    File {
+        op: RedirectOp,
+        target: String,
+    },
     /// `2>&1`
     StderrToStdout,
     /// `1>&2`
     StdoutToStderr,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct Redirection {
-    pub op: RedirectOp,
-    pub target: String,
 }
 
 #[derive(Debug, Clone, PartialEq)]

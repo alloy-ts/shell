@@ -39,6 +39,7 @@ Supported:
 | Redirections | `< in`, `> out`, `>> out`, `2> err`, `2>> err`, `&> out`, `&>> out`, `2>&1`, `1>&2` |
 | Command sequences | `&&`, `\|\|`, `;`, newline |
 | Environment prefixes | `FOO=bar cmd` |
+| Comments | `# comment` at the start of a word |
 | Quoting | `'literal'`, `"escapes \$ \" \\ \`"`, `\x` |
 | Line continuations | a backslash immediately before a newline |
 
@@ -48,8 +49,14 @@ an expansion stage is what keeps the VM free of injection surfaces:
 - variable expansion (`$VAR`, `${VAR}`)
 - command substitution (`$(...)`, backticks)
 - globbing (`*`, `?`, `[...]`)
-- comments (`#` is an ordinary character)
 - background jobs (`&`), subshells, brace expansion, job control
+
+This is a POSIX-style **literal subset**, not a full POSIX shell or Bash. The
+parser rejects unsupported expansion and control-flow syntax instead of
+running it with a different meaning. `&>` and `&>>` are optional extensions,
+not POSIX operators. Commands and file redirections still use the sandboxed
+VM; file descriptors, process concurrency and expansion semantics differ from
+`sh`. Do not use this runtime to validate or execute arbitrary POSIX scripts.
 
 ### Strict parsing
 

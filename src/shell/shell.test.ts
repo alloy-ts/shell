@@ -22,6 +22,23 @@ import {
 } from "./index.ts";
 
 describe("Bun-compatible Shell ($)", () => {
+  test("JS byte sources and output sinks", async () => {
+    const bytes = new Uint8Array([0, 65, 255]);
+    const result = await $`cat`.stdin(new Blob([bytes]));
+    expect([...result.stdout]).toEqual([...bytes]);
+    const sink = new Uint8Array(8);
+    await $`cat`.stdin(bytes.buffer).stdout(sink);
+    expect(Array.from(sink.slice(0, bytes.length))).toEqual(Array.from(bytes));
+    const chunks: Uint8Array[] = [];
+    await $`cat`.stdin(new Response(bytes)).stdout(
+      new WritableStream({
+        write(chunk) {
+          chunks.push(chunk);
+        },
+      }),
+    );
+    expect(Array.from(chunks[0]!)).toEqual(Array.from(bytes));
+  });
   test("echo outputs text", async () => {
     const text = await $`echo "Hello World!"`.text();
     expect(text.trim()).toBe("Hello World!");
@@ -121,24 +138,16 @@ describe("child_process sandboxing", () => {
 
   test("Shell child_process methods inherit the shell allowlist", () => {
     const shell = new Shell({ allowHostExecutables: { pod: "/bin/echo" } });
-    expect(shell.exec("pod instance_exec").stdout.toString().trim()).toBe(
-      "instance_exec",
+    expect(shell.exec("pod instance_exec").stdout.toString().trim()).toBe("instance_exec");
+    expect(shell.execSync("pod instance_sync").toString().trim()).toBe("instance_sync");
+    expect(shell.execFile("pod", ["instance_file"]).stdout.toString().trim()).toBe("instance_file");
+    expect(shell.execFileSync("pod", ["instance_file_sync"]).toString().trim()).toBe(
+      "instance_file_sync",
     );
-    expect(shell.execSync("pod instance_sync").toString().trim()).toBe(
-      "instance_sync",
+    expect(shell.spawn("pod", ["instance_spawn"]).stdout.toString().trim()).toBe("instance_spawn");
+    expect(shell.spawnSync("pod", ["instance_spawn_sync"]).stdout.toString().trim()).toBe(
+      "instance_spawn_sync",
     );
-    expect(
-      shell.execFile("pod", ["instance_file"]).stdout.toString().trim(),
-    ).toBe("instance_file");
-    expect(
-      shell.execFileSync("pod", ["instance_file_sync"]).toString().trim(),
-    ).toBe("instance_file_sync");
-    expect(shell.spawn("pod", ["instance_spawn"]).stdout.toString().trim()).toBe(
-      "instance_spawn",
-    );
-    expect(
-      shell.spawnSync("pod", ["instance_spawn_sync"]).stdout.toString().trim(),
-    ).toBe("instance_spawn_sync");
   });
 
   test("Shell child_process methods deny non-allowlisted executables", () => {
@@ -264,9 +273,7 @@ describe("allowPackageScripts / allowNodeModulesBin / allowLocalExecutables", ()
   test("fluent allowNodeModulesBin on a command promise", async () => {
     const dir = makeProject("fluent");
     const shell = new Shell({ cwd: dir });
-    const res = await new ShellCommandPromise(shell, "toolbin").allowNodeModulesBin([
-      "toolbin",
-    ]);
+    const res = await new ShellCommandPromise(shell, "toolbin").allowNodeModulesBin(["toolbin"]);
     expect(res.exitCode).toBe(0);
     expect(res.stdout.toString().trim()).toBe("bin-tool");
   });
