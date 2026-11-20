@@ -11,7 +11,7 @@ import {
   execFileSync as napiExecFileSync,
   spawn as napiSpawn,
   spawnSync as napiSpawnSync,
-} from "../../../dist/index.mjs";
+} from "../../dist/index.mjs";
 
 /**
  * Default host-executable allowlist: only `node` and `npm` are permitted.

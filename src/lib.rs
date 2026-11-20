@@ -1,6 +1,5 @@
 use napi_derive::napi;
 
-#[path = "../sources/shell/src/mod.rs"]
 pub mod shell;
 pub use shell::{
     ChildProcessOptions, ExecResult, Shell, ShellOpts, ShellPromiseResult, braces, escape, exec,
