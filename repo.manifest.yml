@@ -1,4 +1,4 @@
-name: core
+name: shell
 version: 0.0.0
 type: module
 owner: alloy-ts
@@ -12,9 +12,9 @@ config:
   - commit.gpgsign: true
   - core.hooksPath: scripts/hooks/_
 remote:
-  - https://repo.chen.software/alloy-ts/core
-  - https://codeberg.org/alloy-ts/core
-  - https://github.com/alloy-ts/core
-  - https://gitlab.com/alloy-ts/core
-  - https://bitbucket.org/alloy-ts/core
-  - https://dev.azure.com/ChenSoftware/alloy-ts/_git/core
+  - https://repo.chen.software/alloy-ts/shell
+  - https://codeberg.org/alloy-ts/shell
+  - https://github.com/alloy-ts/shell
+  - https://gitlab.com/alloy-ts/shell
+  - https://bitbucket.org/alloy-ts/shell
+  - https://dev.azure.com/ChenSoftware/alloy-ts/_git/shell
