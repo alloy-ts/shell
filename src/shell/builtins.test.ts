@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vite-plus/test";
-import { $ } from "./index.ts";
+import { execFileSync } from "node:child_process";
+import { $, Shell } from "./index.ts";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
@@ -61,49 +62,64 @@ describe("Shell Builtin Commands", () => {
     expect(inverted.trim()).toBe("cherry");
   });
 
-  test("touch, ls, cat, and rm", async () => {
+  test("touch, ls, cat, and rm", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "shell-test-"));
-    const fileA = path.join(tmpDir, "test.txt");
+    const shell = new Shell({ cwd: tmpDir });
 
     // touch
-    await $`touch ${fileA}`;
-    expect(fs.existsSync(fileA)).toBe(true);
+    expect(shell.run("touch test.txt").exitCode).toBe(0);
+    expect(fs.existsSync(path.join(tmpDir, "test.txt"))).toBe(true);
 
-    // echo > file
-    await $`echo "contents" > ${fileA}`;
+    // echo > file (redirections are confined to cwd too)
+    expect(shell.run('echo "contents" > test.txt').exitCode).toBe(0);
 
     // cat
-    const content = await $`cat ${fileA}`.text();
-    expect(content.trim()).toBe("contents");
+    expect(shell.exec("cat test.txt").stdout.toString().trim()).toBe("contents");
 
     // ls
-    const list = await $`ls ${tmpDir}`.text();
-    expect(list.trim()).toContain("test.txt");
+    expect(shell.exec("ls").stdout.toString().trim()).toContain("test.txt");
 
     // rm
-    await $`rm ${fileA}`;
-    expect(fs.existsSync(fileA)).toBe(false);
+    expect(shell.run("rm test.txt").exitCode).toBe(0);
+    expect(fs.existsSync(path.join(tmpDir, "test.txt"))).toBe(false);
 
-    // rm -r
-    await $`rm -rf ${tmpDir}`;
-    expect(fs.existsSync(tmpDir)).toBe(false);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  test("mkdir and mv", async () => {
+  test("mkdir and mv", () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "shell-mkdir-"));
-    const subDir = path.join(tmpDir, "sub");
-    const srcFile = path.join(tmpDir, "foo.txt");
-    const dstFile = path.join(tmpDir, "bar.txt");
+    const shell = new Shell({ cwd: tmpDir });
 
-    await $`mkdir -p ${subDir}`;
-    expect(fs.existsSync(subDir)).toBe(true);
+    expect(shell.run("mkdir -p sub/sub2").exitCode).toBe(0);
+    expect(fs.existsSync(path.join(tmpDir, "sub/sub2"))).toBe(true);
 
-    await $`touch ${srcFile}`;
-    await $`mv ${srcFile} ${dstFile}`;
-    expect(fs.existsSync(srcFile)).toBe(false);
-    expect(fs.existsSync(dstFile)).toBe(true);
+    expect(shell.run("touch foo.txt").exitCode).toBe(0);
+    expect(shell.run("mv foo.txt bar.txt").exitCode).toBe(0);
+    expect(fs.existsSync(path.join(tmpDir, "foo.txt"))).toBe(false);
+    expect(fs.existsSync(path.join(tmpDir, "bar.txt"))).toBe(true);
 
-    await $`rm -rf ${tmpDir}`;
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  test("filesystem access is confined to shell cwd", () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "shell-confine-"));
+    const shell = new Shell({ cwd: tmpDir });
+    const outside = path.join(tmpDir, "..", "shell-escape-probe");
+
+    const absolute = shell.run(`touch ${outside}`, { nothrow: true });
+    expect(absolute.exitCode).toBe(1);
+    expect(absolute.stderr.toString()).toContain("outside shell cwd");
+
+    const traversal = shell.run("touch ../shell-escape-probe", { nothrow: true });
+    expect(traversal.exitCode).toBe(1);
+    expect(traversal.stderr.toString()).toContain("outside shell cwd");
+
+    const redirect = shell.run("echo hi > ../shell-escape-probe", { nothrow: true });
+    expect(redirect.exitCode).toBe(1);
+    expect(redirect.stderr.toString()).toContain("outside shell cwd");
+
+    expect(fs.existsSync(outside)).toBe(false);
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   });
 
   test("which finds system executables", async () => {
@@ -125,17 +141,17 @@ describe("Shell Builtin Commands", () => {
     expect(lastField).toBe("4 four\n");
   });
 
-  test("repo and git builtin", async () => {
-    const repoHelp = await $`repo`.text();
-    expect(repoHelp).toContain("Usage: repo <subcommand>");
+  test("repo and git builtin require an allowlisted git", () => {
+    const denied = new Shell().exec("git status");
+    expect(denied.exitCode).toBe(126);
+    expect(denied.stderr.toString()).toContain("not allowed");
 
-    const gitHelp = await $`git`.text();
-    expect(gitHelp).toContain("Usage: repo <subcommand>");
+    const gitPath = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    const shell = new Shell({ allowHostExecutables: { git: gitPath } });
 
-    const isRepo = await $`git is-repo`.text();
-    expect(isRepo.trim()).toBe("true");
-
-    const status = await $`git status`.text();
-    expect(status).toContain("git_dir:");
+    expect(shell.exec("repo").stdout.toString()).toContain("Usage: repo <subcommand>");
+    expect(shell.exec("git").stdout.toString()).toContain("Usage: repo <subcommand>");
+    expect(shell.exec("git is-repo").stdout.toString().trim()).toBe("true");
+    expect(shell.exec("git status").stdout.toString()).toContain("git_dir:");
   });
 });

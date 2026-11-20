@@ -1,12 +1,14 @@
 //! `repo` builtin implemented with the `git` CLI so it works without the
 //! monorepo's gix-backed repository module.
 
-use crate::shell::builtins::BuiltinResult;
+use crate::shell::builtins::{BuiltinResult, confined_path};
 use std::path::Path;
 use std::process::Command;
 
-fn run_git(cwd: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
-    Command::new("git").args(args).current_dir(cwd).output()
+/// `git` must come from `allowHostExecutables["git"]` — like every other
+/// external executable, this builtin may never resolve it from PATH.
+fn run_git(git: &str, cwd: &Path, args: &[&str]) -> std::io::Result<std::process::Output> {
+    Command::new(git).args(args).current_dir(cwd).output()
 }
 
 fn ok(stdout: Vec<u8>) -> BuiltinResult {
@@ -25,7 +27,20 @@ fn fail(message: String) -> BuiltinResult {
     }
 }
 
-pub fn builtin_repo(args: &[String], cwd: &Path) -> BuiltinResult {
+/// Same exit code convention as a denied external command (126).
+fn denied(message: &str) -> BuiltinResult {
+    BuiltinResult {
+        exit_code: 126,
+        stdout: Vec::new(),
+        stderr: message.as_bytes().to_vec(),
+    }
+}
+
+pub fn builtin_repo(
+    args: &[String],
+    cwd: &Path,
+    git_executable: Option<&str>,
+) -> BuiltinResult {
     if args.is_empty() {
         let help = b"Usage: repo <subcommand> [args...]\n\
 Subcommands:\n  \
@@ -37,26 +52,30 @@ is-bare          Check if repository is bare\n";
         return ok(help.to_vec());
     }
 
+    let Some(git) = git_executable else {
+        return denied("git: host executable not allowed (missing from allowHostExecutables)\n");
+    };
+
     let subcmd = args[0].as_str();
     let subargs = &args[1..];
 
     match subcmd {
-        "status" => match run_git(cwd, &["rev-parse", "--absolute-git-dir"]) {
+        "status" => match run_git(git, cwd, &["rev-parse", "--absolute-git-dir"]) {
             Ok(out) if out.status.success() => {
                 let git_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
                 let mut text = format!("git_dir: {}\n", git_dir);
 
-                if let Ok(out) = run_git(cwd, &["rev-parse", "--show-toplevel"]) {
+                if let Ok(out) = run_git(git, cwd, &["rev-parse", "--show-toplevel"]) {
                     if out.status.success() {
                         let work_dir = String::from_utf8_lossy(&out.stdout).trim().to_string();
                         text.push_str(&format!("work_dir: {}\n", work_dir));
                     }
                 }
-                if let Ok(out) = run_git(cwd, &["status", "--porcelain"]) {
+                if let Ok(out) = run_git(git, cwd, &["status", "--porcelain"]) {
                     let is_empty = out.stdout.is_empty();
                     text.push_str(&format!("is_empty: {}\n", is_empty));
                 }
-                if let Ok(out) = run_git(cwd, &["rev-parse", "HEAD"]) {
+                if let Ok(out) = run_git(git, cwd, &["rev-parse", "HEAD"]) {
                     if out.status.success() {
                         let head = String::from_utf8_lossy(&out.stdout).trim().to_string();
                         text.push_str(&format!("head: {}\n", head));
@@ -72,13 +91,16 @@ is-bare          Check if repository is bare\n";
             Err(e) => fail(format!("repo status error: {}\n", e)),
         },
         "init" => {
-            let target = subargs
-                .first()
-                .map(|p| cwd.join(p))
-                .unwrap_or_else(|| cwd.to_path_buf());
+            let target = match subargs.first() {
+                None => cwd.to_path_buf(),
+                Some(p) => match confined_path(cwd, p) {
+                    Ok(path) => path,
+                    Err(e) => return fail(format!("repo init: {e}\n")),
+                },
+            };
             let target_str = target.to_string_lossy().to_string();
 
-            match Command::new("git")
+            match Command::new(git)
                 .args(["init", "--initial-branch=main"])
                 .arg(&target_str)
                 .current_dir(cwd)
@@ -94,7 +116,7 @@ is-bare          Check if repository is bare\n";
                 Err(e) => fail(format!("repo init error: {}\n", e)),
             }
         }
-        "head" => match run_git(cwd, &["rev-parse", "HEAD"]) {
+        "head" => match run_git(git, cwd, &["rev-parse", "HEAD"]) {
             Ok(out) if out.status.success() => {
                 ok(format!("{}\n", String::from_utf8_lossy(&out.stdout).trim()).into_bytes())
             }
@@ -105,18 +127,21 @@ is-bare          Check if repository is bare\n";
             Err(e) => fail(format!("repo head error: {}\n", e)),
         },
         "is-repo" => {
-            let target = subargs
-                .first()
-                .map(|p| cwd.join(p))
-                .unwrap_or_else(|| cwd.to_path_buf());
-            let result = Command::new("git")
+            let target = match subargs.first() {
+                None => cwd.to_path_buf(),
+                Some(p) => match confined_path(cwd, p) {
+                    Ok(path) => path,
+                    Err(e) => return fail(format!("repo is-repo: {e}\n")),
+                },
+            };
+            let result = Command::new(git)
                 .args(["rev-parse", "--is-inside-work-tree"])
                 .current_dir(target)
                 .output();
             let is_repo = matches!(result, Ok(ref out) if out.status.success());
             ok(format!("{}\n", is_repo).into_bytes())
         }
-        "is-bare" => match run_git(cwd, &["rev-parse", "--is-bare-repository"]) {
+        "is-bare" => match run_git(git, cwd, &["rev-parse", "--is-bare-repository"]) {
             Ok(out) if out.status.success() => {
                 ok(format!("{}\n", String::from_utf8_lossy(&out.stdout).trim()).into_bytes())
             }

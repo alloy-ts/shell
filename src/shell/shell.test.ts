@@ -66,14 +66,13 @@ describe("Bun-compatible Shell ($)", () => {
   });
 
   test("builtin command 'repo'", async () => {
-    const help = await $`repo`.text();
-    expect(help).toContain("Usage: repo <subcommand>");
+    const { execFileSync } = await import("node:child_process");
+    const gitPath = execFileSync("which", ["git"], { encoding: "utf8" }).trim();
+    const shell = new Shell({ allowHostExecutables: { git: gitPath } });
 
-    const isRepo = await $`repo is-repo`.text();
-    expect(isRepo.trim()).toBe("true");
-
-    const status = await $`repo status`.text();
-    expect(status).toContain("git_dir:");
+    expect(shell.exec("repo").stdout.toString()).toContain("Usage: repo <subcommand>");
+    expect(shell.exec("repo is-repo").stdout.toString().trim()).toBe("true");
+    expect(shell.exec("repo status").stdout.toString()).toContain("git_dir:");
   });
 
   test("ShellOpts allowHostExecutables: absolute path allowlist", () => {

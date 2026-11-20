@@ -3,12 +3,77 @@
 //! echo, pwd, cd, ls, rm, cat, touch, mkdir, which, mv, exit, true, false, yes, seq, dirname, basename.
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub struct BuiltinResult {
     pub exit_code: i32,
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+}
+
+fn denied_path(target: &str) -> String {
+    format!("path outside shell cwd is not allowed: {target}")
+}
+
+/// Resolve `target` strictly inside the shell's cwd.
+///
+/// Rejects absolute paths, `..` traversal, and symlinks (in the longest
+/// existing ancestor) that resolve outside the root. This is the single
+/// permission check used by every filesystem-touching builtin and by VM
+/// redirections — nothing gets to open a path outside the shell root.
+pub fn confined_path(cwd: &Path, target: &str) -> std::result::Result<PathBuf, String> {
+    let root = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    let rel = Path::new(target);
+    if rel.is_absolute() {
+        return Err(denied_path(target));
+    }
+
+    let mut joined = root.clone();
+    for comp in rel.components() {
+        match comp {
+            Component::Normal(c) => joined.push(c),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !joined.pop() || !joined.starts_with(&root) {
+                    return Err(denied_path(target));
+                }
+            }
+            _ => return Err(denied_path(target)),
+        }
+    }
+
+    // Resolve symlinks in the longest existing ancestor so a link inside cwd
+    // cannot point out of the sandbox.
+    let mut ancestor = joined.as_path();
+    while !ancestor.exists() {
+        match ancestor.parent() {
+            Some(parent) => ancestor = parent,
+            None => return Err(denied_path(target)),
+        }
+    }
+    let canonical = fs::canonicalize(ancestor).map_err(|_| denied_path(target))?;
+    let suffix = joined.strip_prefix(ancestor).unwrap_or(Path::new(""));
+    // `canonical.join("")` adds a trailing slash on Unix, which turns an
+    // existing regular file into an ENOTDIR path. Return the canonical path
+    // directly when there is no remaining suffix.
+    let final_path = if suffix.as_os_str().is_empty() {
+        canonical
+    } else {
+        canonical.join(suffix)
+    };
+    if final_path.starts_with(&root) {
+        Ok(final_path)
+    } else {
+        Err(denied_path(target))
+    }
+}
+
+fn path_denied(command: &str, target: &str) -> BuiltinResult {
+    BuiltinResult {
+        exit_code: 1,
+        stdout: Vec::new(),
+        stderr: format!("{command}: {}\n", denied_path(target)).into_bytes(),
+    }
 }
 
 pub fn is_builtin(name: &str) -> bool {
@@ -40,14 +105,22 @@ pub fn is_builtin(name: &str) -> bool {
         )
 }
 
+/// `git_executable` is the absolute path from `allowHostExecutables["git"]`.
+/// The repo/git builtins are the only builtins that spawn a process, so they
+/// must be gated by the same allowlist as any other external command.
 pub fn run_builtin(
     name: &str,
     args: &[String],
     stdin_data: &[u8],
     cwd: &Path,
+    git_executable: Option<&str>,
 ) -> Option<BuiltinResult> {
     match name {
-        "repo" | "git" => Some(crate::shell::repo_builtin::builtin_repo(args, cwd)),
+        "repo" | "git" => Some(crate::shell::repo_builtin::builtin_repo(
+            args,
+            cwd,
+            git_executable,
+        )),
         "echo" => Some(builtin_echo(args)),
         "pwd" => Some(builtin_pwd(cwd)),
         "cd" => Some(builtin_cd(args, cwd)),
@@ -241,7 +314,10 @@ fn builtin_awk(args: &[String], stdin_data: &[u8], cwd: &Path) -> BuiltinResult 
             if file == "-" {
                 inputs.push(String::from_utf8_lossy(stdin_data).to_string());
             } else {
-                let path = cwd.join(file);
+                let path = match confined_path(cwd, file) {
+                    Ok(p) => p,
+                    Err(_) => return path_denied("awk", file),
+                };
                 match fs::read_to_string(&path) {
                     Ok(content) => inputs.push(content),
                     Err(e) => {
@@ -327,10 +403,9 @@ fn builtin_pwd(cwd: &Path) -> BuiltinResult {
 
 fn builtin_cd(args: &[String], cwd: &Path) -> BuiltinResult {
     let target = if let Some(first) = args.first() {
-        if first == "~" {
-            dirs_home()
-        } else {
-            cwd.join(first)
+        match confined_path(cwd, first) {
+            Ok(p) => p,
+            Err(_) => return path_denied("cd", first),
         }
     } else {
         dirs_home()
@@ -380,7 +455,14 @@ fn builtin_ls(args: &[String], cwd: &Path) -> BuiltinResult {
     let target_paths = if paths.is_empty() {
         vec![cwd.to_path_buf()]
     } else {
-        paths.into_iter().map(|p| cwd.join(p)).collect()
+        let mut resolved = Vec::new();
+        for p in paths {
+            match confined_path(cwd, p) {
+                Ok(path) => resolved.push(path),
+                Err(_) => return path_denied("ls", p),
+            }
+        }
+        resolved
     };
 
     let mut stdout = Vec::new();
@@ -446,7 +528,10 @@ fn builtin_rm(args: &[String], cwd: &Path) -> BuiltinResult {
                 }
             }
         } else {
-            targets.push(cwd.join(arg));
+            match confined_path(cwd, arg) {
+                Ok(path) => targets.push(path),
+                Err(_) => return path_denied("rm", arg),
+            }
         }
     }
 
@@ -566,7 +651,10 @@ fn builtin_grep(args: &[String], stdin_data: &[u8], cwd: &Path) -> BuiltinResult
     }
 
     for file in &files {
-        let path = cwd.join(file);
+        let path = match confined_path(cwd, file) {
+            Ok(p) => p,
+            Err(_) => return path_denied("grep", file),
+        };
         match fs::read_to_string(&path) {
             Ok(content) => {
                 for line in content.lines() {
@@ -611,7 +699,10 @@ fn builtin_cat(args: &[String], stdin_data: &[u8], cwd: &Path) -> BuiltinResult 
         if arg == "-" {
             stdout.extend_from_slice(stdin_data);
         } else {
-            let path = cwd.join(arg);
+            let path = match confined_path(cwd, arg) {
+                Ok(p) => p,
+                Err(_) => return path_denied("cat", arg),
+            };
             match fs::read(&path) {
                 Ok(bytes) => stdout.extend_from_slice(&bytes),
                 Err(e) => {
@@ -703,7 +794,10 @@ fn builtin_wc(args: &[String], stdin_data: &[u8], cwd: &Path) -> BuiltinResult {
             let (l, w, b) = compute_stats(stdin_data);
             stdout.extend_from_slice(format!("{}\n", format_counts(l, w, b, "-")).as_bytes());
         } else {
-            let path = cwd.join(file);
+            let path = match confined_path(cwd, file) {
+                Ok(p) => p,
+                Err(_) => return path_denied("wc", file),
+            };
             match fs::read(&path) {
                 Ok(data) => {
                     let (l, w, b) = compute_stats(&data);
@@ -729,7 +823,10 @@ fn builtin_touch(args: &[String], cwd: &Path) -> BuiltinResult {
     let mut stderr = Vec::new();
 
     for arg in args {
-        let path = cwd.join(arg);
+        let path = match confined_path(cwd, arg) {
+            Ok(p) => p,
+            Err(_) => return path_denied("touch", arg),
+        };
         if let Err(e) = fs::OpenOptions::new().create(true).truncate(false).write(true).open(&path) {
             exit_code = 1;
             stderr.extend_from_slice(format!("touch: {}: {}\n", path.display(), e).as_bytes());
@@ -751,7 +848,10 @@ fn builtin_mkdir(args: &[String], cwd: &Path) -> BuiltinResult {
         if arg == "-p" {
             parents = true;
         } else {
-            targets.push(cwd.join(arg));
+            match confined_path(cwd, arg) {
+                Ok(path) => targets.push(path),
+                Err(_) => return path_denied("mkdir", arg),
+            }
         }
     }
 
@@ -820,7 +920,10 @@ fn builtin_mv(args: &[String], cwd: &Path) -> BuiltinResult {
     }
 
     let sources = &args[..args.len() - 1];
-    let dest = cwd.join(&args[args.len() - 1]);
+    let dest = match confined_path(cwd, &args[args.len() - 1]) {
+        Ok(p) => p,
+        Err(_) => return path_denied("mv", &args[args.len() - 1]),
+    };
 
     let mut exit_code = 0;
     let mut stderr = Vec::new();
@@ -834,7 +937,10 @@ fn builtin_mv(args: &[String], cwd: &Path) -> BuiltinResult {
     }
 
     for src in sources {
-        let src_path = cwd.join(src);
+        let src_path = match confined_path(cwd, src) {
+            Ok(p) => p,
+            Err(_) => return path_denied("mv", src),
+        };
         let target_path = if dest.is_dir() {
             dest.join(src_path.file_name().unwrap_or_default())
         } else {
@@ -975,5 +1081,60 @@ fn builtin_basename(args: &[String]) -> BuiltinResult {
         exit_code: 0,
         stdout: format!("{}\n", res).into_bytes(),
         stderr: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_root(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("shell-confine-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn confines_paths_inside_cwd() {
+        let root = temp_root("inside");
+        fs::create_dir_all(root.join("a/b")).unwrap();
+        // macOS temp dir is reached through /var -> /private/var, so compare
+        // against the canonicalized root that confined_path returns.
+        let canonical = fs::canonicalize(&root).unwrap();
+        assert_eq!(
+            confined_path(&root, "a/b/c.txt").unwrap(),
+            canonical.join("a/b/c.txt")
+        );
+        assert_eq!(confined_path(&root, "./a").unwrap(), canonical.join("a"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_absolute_paths() {
+        let root = temp_root("absolute");
+        assert!(confined_path(&root, "/etc/passwd").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rejects_parent_traversal() {
+        let root = temp_root("traversal");
+        assert!(confined_path(&root, "../escape").is_err());
+        assert!(confined_path(&root, "a/../../escape").is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = temp_root("symlink");
+        let outside = temp_root("symlink-outside");
+        symlink(&outside, root.join("link")).unwrap();
+        assert!(confined_path(&root, "link/secret").is_err());
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_dir_all(outside).unwrap();
     }
 }

@@ -117,6 +117,14 @@ pub struct ShellOutput {
 /// Exit code and stderr produced when a command is not permitted by any
 /// allow-surface. 126 mirrors the shell convention for "command found but not
 /// executable".
+fn redir_path(cwd: &Path, target: &str) -> std::result::Result<PathBuf, ShellOutput> {
+    crate::shell::builtins::confined_path(cwd, target).map_err(|e| ShellOutput {
+        stdout: Vec::new(),
+        stderr: format!("shell: {e}\n").into_bytes(),
+        exit_code: 1,
+    })
+}
+
 fn denied_output(command: &str) -> ShellOutput {
     ShellOutput {
         stdout: Vec::new(),
@@ -309,7 +317,10 @@ fn execute_command(
     // Process input redirections `<`
     for redir in &cmd.redirects {
         if matches!(redir.op, RedirectOp::Input) {
-            let file_path = cwd.join(&redir.target);
+            let file_path = match redir_path(cwd, &redir.target) {
+                Ok(p) => p,
+                Err(out) => return out,
+            };
             match fs::read(&file_path) {
                 Ok(bytes) => stdin_data = bytes,
                 Err(e) => {
@@ -413,7 +424,8 @@ fn execute_command(
     }
 
     let (mut stdout, mut stderr, exit_code) = if is_builtin(prog_name) {
-        if let Some(res) = run_builtin(prog_name, args, &stdin_data, cwd) {
+        let git_executable = ctx.allow_host_executables.get("git").map(String::as_str);
+        if let Some(res) = run_builtin(prog_name, args, &stdin_data, cwd, git_executable) {
             (res.stdout, res.stderr, res.exit_code)
         } else {
             resolve_non_builtin(prog_name, args, &stdin_data, &effective_env, ctx).unwrap_or_else(
@@ -436,12 +448,18 @@ fn execute_command(
     for redir in &cmd.redirects {
         match redir.op {
             RedirectOp::OutputTruncate => {
-                let file_path = cwd.join(&redir.target);
+                let file_path = match redir_path(cwd, &redir.target) {
+                Ok(p) => p,
+                Err(out) => return out,
+            };
                 let _ = fs::write(file_path, &stdout);
                 stdout.clear();
             }
             RedirectOp::OutputAppend => {
-                let file_path = cwd.join(&redir.target);
+                let file_path = match redir_path(cwd, &redir.target) {
+                Ok(p) => p,
+                Err(out) => return out,
+            };
                 if let Ok(mut f) = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -453,12 +471,18 @@ fn execute_command(
                 stdout.clear();
             }
             RedirectOp::StderrTruncate => {
-                let file_path = cwd.join(&redir.target);
+                let file_path = match redir_path(cwd, &redir.target) {
+                Ok(p) => p,
+                Err(out) => return out,
+            };
                 let _ = fs::write(file_path, &stderr);
                 stderr.clear();
             }
             RedirectOp::StderrAppend => {
-                let file_path = cwd.join(&redir.target);
+                let file_path = match redir_path(cwd, &redir.target) {
+                Ok(p) => p,
+                Err(out) => return out,
+            };
                 if let Ok(mut f) = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -470,7 +494,10 @@ fn execute_command(
                 stderr.clear();
             }
             RedirectOp::BothTruncate => {
-                let file_path = cwd.join(&redir.target);
+                let file_path = match redir_path(cwd, &redir.target) {
+                Ok(p) => p,
+                Err(out) => return out,
+            };
                 let mut combined = stdout.clone();
                 combined.extend_from_slice(&stderr);
                 let _ = fs::write(file_path, combined);
@@ -478,7 +505,10 @@ fn execute_command(
                 stderr.clear();
             }
             RedirectOp::BothAppend => {
-                let file_path = cwd.join(&redir.target);
+                let file_path = match redir_path(cwd, &redir.target) {
+                Ok(p) => p,
+                Err(out) => return out,
+            };
                 if let Ok(mut f) = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
