@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use crate::shell::child_process::{
     Allowances, build_script, context, exec_result, resolve_cwd_env, sync_stdout,
 };
-use crate::shell::parser::parse_shell_script;
+use crate::shell::parser::{SYNTAX_ERROR_EXIT, parse_shell_script};
 use crate::shell::vm::execute_pipeline_sequence;
 
 /// Options for the `Shell` constructor and per-command `run` calls.
@@ -235,19 +235,27 @@ impl Shell {
             (cwd, env_map, nothrow, allowlist, local_exec, scripts, bins)
         };
 
-        let seq =
-            parse_shell_script(&script).map_err(|e| napi::Error::new(Status::GenericFailure, e))?;
-
-        let ctx = crate::shell::vm::ExecContext {
-            cwd: &cwd,
-            env: &env_map,
-            allow_host_executables: &allowlist,
-            allow_local_executables: &local_exec,
-            allow_package_scripts: &scripts,
-            allow_node_modules_bin: &bins,
-            depth: 0,
+        // A syntax error is a failed command, not an API error: report it the
+        // same way as any other non-zero exit so `nothrow` keeps working.
+        let output = match parse_shell_script(&script) {
+            Ok(seq) => {
+                let ctx = crate::shell::vm::ExecContext {
+                    cwd: &cwd,
+                    env: &env_map,
+                    allow_host_executables: &allowlist,
+                    allow_local_executables: &local_exec,
+                    allow_package_scripts: &scripts,
+                    allow_node_modules_bin: &bins,
+                    depth: 0,
+                };
+                execute_pipeline_sequence(&seq, &ctx)
+            }
+            Err(e) => crate::shell::vm::ShellOutput {
+                stdout: Vec::new(),
+                stderr: format!("shell: syntax error: {e}\n").into_bytes(),
+                exit_code: SYNTAX_ERROR_EXIT,
+            },
         };
-        let output = execute_pipeline_sequence(&seq, &ctx);
 
         if output.exit_code != 0 && !nothrow {
             let stderr_str = String::from_utf8_lossy(&output.stderr);

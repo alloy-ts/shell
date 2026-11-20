@@ -1,5 +1,12 @@
 import { describe, expect, test } from "vite-plus/test";
-import { mkdirSync, mkdtempSync, writeFileSync, chmodSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+  chmodSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -262,5 +269,83 @@ describe("allowPackageScripts / allowNodeModulesBin / allowLocalExecutables", ()
     ]);
     expect(res.exitCode).toBe(0);
     expect(res.stdout.toString().trim()).toBe("bin-tool");
+  });
+});
+
+describe("strict parser semantics", () => {
+  function tmpProject(tag: string) {
+    return mkdtempSync(join(tmpdir(), `shell-strict-${tag}-`));
+  }
+
+  test("&> redirects both streams to a file", () => {
+    const dir = tmpProject("both");
+    const shell = new Shell({ cwd: dir });
+    const res = shell.run("echo captured &> out.txt");
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout.toString()).toBe("");
+    expect(readFileSync(join(dir, "out.txt"), "utf8")).toBe("captured\n");
+  });
+
+  test("&>> appends to a file", () => {
+    const dir = tmpProject("both-append");
+    const shell = new Shell({ cwd: dir });
+    shell.run("echo one &>> out.txt");
+    shell.run("echo two &>> out.txt");
+    expect(readFileSync(join(dir, "out.txt"), "utf8")).toBe("one\ntwo\n");
+  });
+
+  test("syntax error fails with exit code 2 instead of running a prefix", () => {
+    const dir = tmpProject("syntax");
+    const shell = new Shell({ cwd: dir });
+    const res = shell.run("echo one & echo two", { nothrow: true });
+    expect(res.exitCode).toBe(2);
+    expect(res.stdout.toString()).toBe("");
+    expect(res.stderr.toString()).toContain("syntax error");
+  });
+
+  test("syntax error throws by default", () => {
+    const shell = new Shell();
+    expect(() => shell.run("echo one & echo two")).toThrow();
+  });
+
+  test("unterminated quote is a syntax error", () => {
+    const shell = new Shell();
+    const res = shell.run("echo 'unterminated", { nothrow: true });
+    expect(res.exitCode).toBe(2);
+    expect(res.stderr.toString()).toContain("unterminated single quote");
+  });
+
+  test("dangling && is a syntax error", () => {
+    const shell = new Shell();
+    const res = shell.run("echo hi &&", { nothrow: true });
+    expect(res.exitCode).toBe(2);
+  });
+
+  test("multi-line script runs every line and concatenates output", () => {
+    const shell = new Shell();
+    const res = shell.run("echo first\necho second");
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout.toString()).toBe("first\nsecond\n");
+  });
+
+  test("backslash newline is a line continuation", () => {
+    const shell = new Shell();
+    const res = shell.run("echo a \\\n  b");
+    expect(res.exitCode).toBe(0);
+    expect(res.stdout.toString()).toBe("a b\n");
+  });
+
+  test("redirection-only command creates the file", () => {
+    const dir = tmpProject("redirect-only");
+    const shell = new Shell({ cwd: dir });
+    const res = shell.run("> created.txt");
+    expect(res.exitCode).toBe(0);
+    expect(existsSync(join(dir, "created.txt"))).toBe(true);
+  });
+
+  test("execFile preserves an empty argument", () => {
+    const shell = new Shell({ allowHostExecutables: { e: "/bin/echo" } });
+    const res = shell.execFile("e", ["", "x"]);
+    expect(res.stdout.toString()).toBe(" x\n");
   });
 });
