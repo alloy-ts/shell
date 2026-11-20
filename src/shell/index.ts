@@ -277,7 +277,10 @@ $.allowNodeModulesBin = (names?: string[]) =>
 $.braces = (pattern: string) => braces(pattern);
 $.escape = (s: string) => escape(s);
 
-// Child process compatibility exports
+// Child process compatibility exports. These module-level functions have no
+// Shell instance, so they run through the VM with an empty allowlist
+// (builtins only). Use `shell.exec` / `shell.execFile` / `shell.spawn` to
+// inherit a Shell instance's allowlists.
 export const exec = napiExec;
 export const execSync = napiExecSync;
 export const execFile = napiExecFile;

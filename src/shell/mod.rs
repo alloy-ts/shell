@@ -19,6 +19,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+use crate::shell::child_process::{
+    Allowances, build_script, context, exec_result, resolve_cwd_env, sync_stdout,
+};
 use crate::shell::parser::parse_shell_script;
 use crate::shell::vm::execute_pipeline_sequence;
 
@@ -263,6 +266,94 @@ impl Shell {
             exit_code: output.exit_code,
         })
     }
+
+    // ---- child_process-style instance methods -------------------------
+    //
+    // Unlike the module-level free functions (which have no Shell instance
+    // and therefore run with an empty allowlist), these inherit all four
+    // allow-surfaces from `self`. `execFile`/`spawn` are quoted back into a
+    // command line so they go through the very same pipeline resolution as
+    // `run()` — no direct spawn, no bypass.
+
+    fn child_run(&self, script: &str, options: Option<ChildProcessOptions>) -> Result<ExecResult> {
+        let (base_cwd, base_env) = {
+            let cfg = self.config.lock().unwrap();
+            (cfg.cwd.clone(), cfg.env.clone())
+        };
+        let (cwd, env_map) = resolve_cwd_env(
+            options.as_ref(),
+            base_cwd.as_deref(),
+            base_env.as_ref(),
+        );
+        let allow = {
+            let cfg = self.config.lock().unwrap();
+            Allowances {
+                host: cfg.allow_host_executables.clone().unwrap_or_default(),
+                local: cfg.allow_local_executables.clone().unwrap_or_default(),
+                scripts: cfg.allow_package_scripts.clone().unwrap_or_default(),
+                bins: cfg.allow_node_modules_bin.clone().unwrap_or_default(),
+            }
+        };
+        let ctx = context(&cwd, &env_map, &allow);
+        exec_result(script, &ctx)
+    }
+
+    #[napi]
+    pub fn exec(&self, command: String, options: Option<ChildProcessOptions>) -> Result<ExecResult> {
+        self.child_run(&command, options)
+    }
+
+    #[napi]
+    pub fn exec_sync(
+        &self,
+        command: String,
+        options: Option<ChildProcessOptions>,
+    ) -> Result<Buffer> {
+        let result = self.child_run(&command, options)?;
+        sync_stdout(result, "execSync", &command)
+    }
+
+    #[napi]
+    pub fn exec_file(
+        &self,
+        file: String,
+        args: Option<Vec<String>>,
+        options: Option<ChildProcessOptions>,
+    ) -> Result<ExecResult> {
+        self.child_run(&build_script(&file, args.as_ref()), options)
+    }
+
+    #[napi]
+    pub fn exec_file_sync(
+        &self,
+        file: String,
+        args: Option<Vec<String>>,
+        options: Option<ChildProcessOptions>,
+    ) -> Result<Buffer> {
+        let script = build_script(&file, args.as_ref());
+        let result = self.child_run(&script, options)?;
+        sync_stdout(result, "execFileSync", &script)
+    }
+
+    #[napi]
+    pub fn spawn(
+        &self,
+        command: String,
+        args: Option<Vec<String>>,
+        options: Option<ChildProcessOptions>,
+    ) -> Result<ExecResult> {
+        self.exec_file(command, args, options)
+    }
+
+    #[napi]
+    pub fn spawn_sync(
+        &self,
+        command: String,
+        args: Option<Vec<String>>,
+        options: Option<ChildProcessOptions>,
+    ) -> Result<ExecResult> {
+        self.exec_file(command, args, options)
+    }
 }
 
 #[napi(object)]
@@ -375,6 +466,64 @@ mod tests {
         assert_eq!(
             shell.allow_local_executables(None).unwrap().get("tool"),
             Some(&"scripts/tool.sh".to_string())
+        );
+    }
+
+    #[test]
+    fn shell_exec_instance_uses_allowlist() {
+        let opts = ShellOpts {
+            allow_host_executables: Some(HashMap::from([(
+                "pod".to_string(),
+                "/bin/echo".to_string(),
+            )])),
+            ..Default::default()
+        };
+        let shell = Shell::new(Some(opts)).unwrap();
+        let res = shell.exec("pod via-instance".to_string(), None).unwrap();
+        assert_eq!(res.exit_code, 0);
+        assert_eq!(String::from_utf8_lossy(res.stdout.as_ref()).trim(), "via-instance");
+    }
+
+    #[test]
+    fn shell_exec_instance_denies_non_allowlisted() {
+        let shell = Shell::new(None).unwrap();
+        let res = shell
+            .exec("/bin/echo escape".to_string(), None)
+            .unwrap();
+        assert_eq!(res.exit_code, 126);
+        assert!(res.stdout.as_ref().is_empty());
+    }
+
+    #[test]
+    fn shell_exec_file_quotes_args_and_uses_allowlist() {
+        let shell = Shell::new(None).unwrap();
+        let res = shell
+            .exec_file("echo".to_string(), Some(vec!["hello world".to_string()]), None)
+            .unwrap();
+        assert_eq!(res.exit_code, 0);
+        assert_eq!(
+            String::from_utf8_lossy(res.stdout.as_ref()).trim(),
+            "hello world"
+        );
+    }
+
+    #[test]
+    fn free_exec_functions_cannot_spawn_host_executables() {
+        // Module-level APIs have no Shell instance: only builtins may run.
+        let res = crate::shell::child_process::exec("/bin/echo escape".to_string(), None).unwrap();
+        assert_eq!(res.exit_code, 126);
+        assert!(res.stdout.as_ref().is_empty());
+
+        let res = crate::shell::child_process::exec_file(
+            "echo".to_string(),
+            Some(vec!["builtin-ok".to_string()]),
+            None,
+        )
+        .unwrap();
+        assert_eq!(res.exit_code, 0);
+        assert_eq!(
+            String::from_utf8_lossy(res.stdout.as_ref()).trim(),
+            "builtin-ok"
         );
     }
 }

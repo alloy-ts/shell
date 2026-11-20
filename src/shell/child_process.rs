@@ -1,16 +1,23 @@
-//! Node:child_process compatible alias APIs:
-//! exec, execSync, execFile, execFileSync, spawn, spawnSync
+//! Node:child_process compatible alias APIs.
+//!
+//! Every entry point is routed through the shell VM: the module-level free
+//! functions use an empty allowlist (builtins only), while `Shell`'s instance
+//! methods inherit the shell's four allow-surfaces. Nothing here spawns an
+//! arbitrary executable outside the sandbox.
 
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::path::{Path, PathBuf};
 
 use crate::shell::parser::parse_shell_script;
-use crate::shell::process::{CommandOptions, EnvEntry, outcome_from_command_result, run_command};
-use crate::shell::vm::execute_pipeline_sequence;
+use crate::shell::vm::{ExecContext, execute_pipeline_sequence};
 
+/// Options for the child_process-style APIs.
+///
+/// `shell`, `timeout`, `max_buffer` and `encoding` are accepted for API
+/// compatibility but ignored: execution always goes through the VM, which
+/// never shells out to an arbitrary interpreter.
 #[napi(object)]
 pub struct ChildProcessOptions {
     pub cwd: Option<String>,
@@ -29,40 +36,89 @@ pub struct ExecResult {
     pub status: Option<i32>,
 }
 
-#[napi]
-pub fn exec(command: String, options: Option<ChildProcessOptions>) -> Result<ExecResult> {
-    let opts = options.unwrap_or(ChildProcessOptions {
-        cwd: None,
-        env: None,
-        timeout: None,
-        max_buffer: None,
-        encoding: None,
-        shell: None,
-    });
+/// The four allow-surfaces handed to the VM. Empty by default for the
+/// module-level free functions; `Shell` instance methods populate them from
+/// their own configuration.
+#[derive(Default)]
+pub struct Allowances {
+    pub host: HashMap<String, String>,
+    pub local: HashMap<String, String>,
+    pub scripts: Vec<String>,
+    pub bins: Vec<String>,
+}
 
-    let cwd = opts
-        .cwd
+/// Resolve cwd/env from options, falling back to the shell's base config.
+pub fn resolve_cwd_env(
+    options: Option<&ChildProcessOptions>,
+    base_cwd: Option<&str>,
+    base_env: Option<&HashMap<String, String>>,
+) -> (PathBuf, HashMap<String, String>) {
+    let cwd = options
+        .and_then(|o| o.cwd.clone())
+        .or_else(|| base_cwd.map(str::to_string))
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
 
-    let env_map = opts.env.unwrap_or_else(|| std::env::vars().collect());
+    let mut env = base_env.cloned().unwrap_or_else(|| std::env::vars().collect());
+    if let Some(opts) = options {
+        if let Some(overrides) = &opts.env {
+            for (k, v) in overrides {
+                env.insert(k.clone(), v.clone());
+            }
+        }
+    }
+    (cwd, env)
+}
 
-    let seq =
-        parse_shell_script(&command).map_err(|e| napi::Error::new(Status::GenericFailure, e))?;
-    // The standalone exec API has no ShellOpts, so no host executables are
-    // allowlisted here: only shell builtins can run through the VM pipeline.
-    // Use execFile/spawn for direct, unrestricted process execution.
-    let ctx = crate::shell::vm::ExecContext {
-        cwd: &cwd,
-        env: &env_map,
-        allow_host_executables: &HashMap::new(),
-        allow_local_executables: &HashMap::new(),
-        allow_package_scripts: &[],
-        allow_node_modules_bin: &[],
+/// Build an execution context borrowing the resolved cwd/env/allowances.
+pub fn context<'a>(
+    cwd: &'a Path,
+    env: &'a HashMap<String, String>,
+    allow: &'a Allowances,
+) -> ExecContext<'a> {
+    ExecContext {
+        cwd,
+        env,
+        allow_host_executables: &allow.host,
+        allow_local_executables: &allow.local,
+        allow_package_scripts: &allow.scripts,
+        allow_node_modules_bin: &allow.bins,
         depth: 0,
-    };
-    let out = execute_pipeline_sequence(&seq, &ctx);
+    }
+}
 
+/// Shell-quote a single argument for the VM parser (single quotes with
+/// backslash escape for embedded quotes, which the parser handles).
+pub fn quote_arg(s: &str) -> String {
+    if !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | ':' | '@' | '=' | ',' | '+')
+        })
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Turn an `execFile`/`spawn` invocation into a shell command line so it goes
+/// through exactly the same allowlist resolution as `Shell.run`.
+pub fn build_script(file: &str, args: Option<&Vec<String>>) -> String {
+    let mut script = quote_arg(file);
+    if let Some(args) = args {
+        for arg in args {
+            script.push(' ');
+            script.push_str(&quote_arg(arg));
+        }
+    }
+    script
+}
+
+/// Parse and execute a script in the given context, returning the
+/// child_process-style result.
+pub fn exec_result(script: &str, ctx: &ExecContext) -> Result<ExecResult> {
+    let seq = parse_shell_script(script)
+        .map_err(|e| napi::Error::new(Status::GenericFailure, e))?;
+    let out = execute_pipeline_sequence(&seq, ctx);
     Ok(ExecResult {
         stdout: Buffer::from(out.stdout),
         stderr: Buffer::from(out.stderr),
@@ -71,51 +127,36 @@ pub fn exec(command: String, options: Option<ChildProcessOptions>) -> Result<Exe
     })
 }
 
-#[napi]
-pub fn exec_sync(command: String, options: Option<ChildProcessOptions>) -> Result<Buffer> {
-    let opts = options.unwrap_or(ChildProcessOptions {
-        cwd: None,
-        env: None,
-        timeout: None,
-        max_buffer: None,
-        encoding: None,
-        shell: None,
-    });
-
-    let cwd = opts
-        .cwd
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-
-    let shell_cmd = if cfg!(windows) { "cmd" } else { "sh" };
-    let shell_arg = if cfg!(windows) { "/c" } else { "-c" };
-
-    let mut cmd = Command::new(opts.shell.as_deref().unwrap_or(shell_cmd));
-    cmd.arg(shell_arg).arg(&command);
-    cmd.current_dir(cwd);
-
-    if let Some(env) = opts.env {
-        cmd.envs(env);
-    }
-
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let output = cmd
-        .output()
-        .map_err(|e| napi::Error::new(Status::GenericFailure, format!("execSync failed: {e}")))?;
-
-    if !output.status.success() {
+/// Convert a non-zero result into the error shape of the `*Sync` APIs.
+pub fn sync_stdout(result: ExecResult, label: &str, script: &str) -> Result<Buffer> {
+    if result.exit_code != 0 {
+        let msg = String::from_utf8_lossy(result.stderr.as_ref());
         return Err(napi::Error::new(
             Status::GenericFailure,
-            format!(
-                "Command failed: {}\n{}",
-                command,
-                String::from_utf8_lossy(&output.stderr)
-            ),
+            format!("{label} failed with exit code {}: {}{}", result.exit_code, script, msg),
         ));
     }
+    Ok(result.stdout)
+}
 
-    Ok(Buffer::from(output.stdout))
+/// Module-level free functions have no Shell instance, so they run with an
+/// empty allowlist — only builtins are available.
+fn free_exec(script: &str, options: Option<ChildProcessOptions>) -> Result<ExecResult> {
+    let (cwd, env) = resolve_cwd_env(options.as_ref(), None, None);
+    let allow = Allowances::default();
+    let ctx = context(&cwd, &env, &allow);
+    exec_result(script, &ctx)
+}
+
+#[napi]
+pub fn exec(command: String, options: Option<ChildProcessOptions>) -> Result<ExecResult> {
+    free_exec(&command, options)
+}
+
+#[napi]
+pub fn exec_sync(command: String, options: Option<ChildProcessOptions>) -> Result<Buffer> {
+    let result = free_exec(&command, options)?;
+    sync_stdout(result, "execSync", &command)
 }
 
 #[napi]
@@ -124,41 +165,7 @@ pub fn exec_file(
     args: Option<Vec<String>>,
     options: Option<ChildProcessOptions>,
 ) -> Result<ExecResult> {
-    let opts = options.unwrap_or(ChildProcessOptions {
-        cwd: None,
-        env: None,
-        timeout: None,
-        max_buffer: None,
-        encoding: None,
-        shell: None,
-    });
-
-    let env_entries = opts.env.map(|map| {
-        map.into_iter()
-            .map(|(name, value)| EnvEntry { name, value })
-            .collect()
-    });
-
-    let cmd_opts = CommandOptions {
-        program: file,
-        args,
-        cwd: opts.cwd,
-        env: env_entries,
-        input: None,
-        timeout_ms: opts.timeout,
-        cleanup_timeout_ms: Some(5000.0),
-        limits: None,
-    };
-
-    let result = run_command(cmd_opts).map_err(|e| napi::Error::new(Status::GenericFailure, e))?;
-    let (stdout, stderr, exit_code) = outcome_from_command_result(result);
-
-    Ok(ExecResult {
-        stdout: Buffer::from(stdout),
-        stderr: Buffer::from(stderr),
-        exit_code,
-        status: Some(exit_code),
-    })
+    free_exec(&build_script(&file, args.as_ref()), options)
 }
 
 #[napi]
@@ -167,44 +174,9 @@ pub fn exec_file_sync(
     args: Option<Vec<String>>,
     options: Option<ChildProcessOptions>,
 ) -> Result<Buffer> {
-    let opts = options.unwrap_or(ChildProcessOptions {
-        cwd: None,
-        env: None,
-        timeout: None,
-        max_buffer: None,
-        encoding: None,
-        shell: None,
-    });
-
-    let mut cmd = Command::new(&file);
-    if let Some(arguments) = args {
-        cmd.args(arguments);
-    }
-    if let Some(cwd) = opts.cwd {
-        cmd.current_dir(cwd);
-    }
-    if let Some(env) = opts.env {
-        cmd.envs(env);
-    }
-
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let output = cmd.output().map_err(|e| {
-        napi::Error::new(Status::GenericFailure, format!("execFileSync failed: {e}"))
-    })?;
-
-    if !output.status.success() {
-        return Err(napi::Error::new(
-            Status::GenericFailure,
-            format!(
-                "Command failed: {}\n{}",
-                file,
-                String::from_utf8_lossy(&output.stderr)
-            ),
-        ));
-    }
-
-    Ok(Buffer::from(output.stdout))
+    let script = build_script(&file, args.as_ref());
+    let result = free_exec(&script, options)?;
+    sync_stdout(result, "execFileSync", &script)
 }
 
 #[napi]
@@ -222,37 +194,5 @@ pub fn spawn_sync(
     args: Option<Vec<String>>,
     options: Option<ChildProcessOptions>,
 ) -> Result<ExecResult> {
-    let opts = options.unwrap_or(ChildProcessOptions {
-        cwd: None,
-        env: None,
-        timeout: None,
-        max_buffer: None,
-        encoding: None,
-        shell: None,
-    });
-
-    let mut cmd = Command::new(&command);
-    if let Some(arguments) = args {
-        cmd.args(arguments);
-    }
-    if let Some(cwd) = opts.cwd {
-        cmd.current_dir(cwd);
-    }
-    if let Some(env) = opts.env {
-        cmd.envs(env);
-    }
-
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
-    let output = cmd
-        .output()
-        .map_err(|e| napi::Error::new(Status::GenericFailure, format!("spawnSync failed: {e}")))?;
-
-    let exit_code = output.status.code().unwrap_or(1);
-    Ok(ExecResult {
-        stdout: Buffer::from(output.stdout),
-        stderr: Buffer::from(output.stderr),
-        exit_code,
-        status: Some(exit_code),
-    })
+    exec_file(command, args, options)
 }
