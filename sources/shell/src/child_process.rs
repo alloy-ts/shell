@@ -52,7 +52,16 @@ pub fn exec(command: String, options: Option<ChildProcessOptions>) -> Result<Exe
     // The standalone exec API has no ShellOpts, so no host executables are
     // allowlisted here: only shell builtins can run through the VM pipeline.
     // Use execFile/spawn for direct, unrestricted process execution.
-    let out = execute_pipeline_sequence(&seq, &cwd, &env_map, &HashMap::new());
+    let ctx = crate::shell::vm::ExecContext {
+        cwd: &cwd,
+        env: &env_map,
+        allow_host_executables: &HashMap::new(),
+        allow_local_executables: &HashMap::new(),
+        allow_package_scripts: &[],
+        allow_node_modules_bin: &[],
+        depth: 0,
+    };
+    let out = execute_pipeline_sequence(&seq, &ctx);
 
     Ok(ExecResult {
         stdout: Buffer::from(out.stdout),
