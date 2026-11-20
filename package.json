@@ -20,7 +20,7 @@
     "./package.json": "./package.json"
   },
   "scripts": {
-    "build": "node --import @oxc-node/core/register build.ts && vp pack",
+    "build": "node --import @oxc-node/core/register scripts/build.ts && vp pack",
     "dev": "vp pack --watch",
     "start": "vp run dist/index.js",
     "test": "node --import @oxc-node/core/register --test && cargo test",
