@@ -10,7 +10,7 @@ use napi_derive::napi;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::shell::parser::parse_shell_script;
+use crate::shell::parser::{SYNTAX_ERROR_EXIT, parse_shell_script};
 use crate::shell::vm::{ExecContext, execute_pipeline_sequence};
 
 /// Options for the child_process-style APIs.
@@ -115,10 +115,18 @@ pub fn build_script(file: &str, args: Option<&Vec<String>>) -> String {
 
 /// Parse and execute a script in the given context, returning the
 /// child_process-style result.
+///
+/// A syntax error is reported as a failed command (exit code 2) rather than
+/// an API error, matching how `exec` reports a non-zero exit.
 pub fn exec_result(script: &str, ctx: &ExecContext) -> Result<ExecResult> {
-    let seq = parse_shell_script(script)
-        .map_err(|e| napi::Error::new(Status::GenericFailure, e))?;
-    let out = execute_pipeline_sequence(&seq, ctx);
+    let out = match parse_shell_script(script) {
+        Ok(seq) => execute_pipeline_sequence(&seq, ctx),
+        Err(e) => crate::shell::vm::ShellOutput {
+            stdout: Vec::new(),
+            stderr: format!("shell: syntax error: {e}\n").into_bytes(),
+            exit_code: SYNTAX_ERROR_EXIT,
+        },
+    };
     Ok(ExecResult {
         stdout: Buffer::from(out.stdout),
         stderr: Buffer::from(out.stderr),
