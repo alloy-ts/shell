@@ -26,6 +26,26 @@ export const defaultAllowHostExecutables: Record<string, string> = {
   ),
 };
 
+/**
+ * Default package.json script allowlist: empty = no scripts are exposed.
+ * Script bodies execute inside the shell VM with the same allow-surfaces, so
+ * enabling scripts is safe-by-construction against host escape.
+ */
+export const defaultAllowPackageScripts: string[] = [];
+
+/**
+ * Default `node_modules/.bin` allowlist: empty = no dependency executables
+ * are exposed. Each allowed entry is spawned directly by the OS (full host
+ * access), so prefer explicit per-name allows over `"*"`.
+ */
+export const defaultAllowNodeModulesBin: string[] = [];
+
+/**
+ * Default local-executable allowlist: empty = no project-relative executables
+ * are exposed.
+ */
+export const defaultAllowLocalExecutables: Record<string, string> = {};
+
 export interface ShellPromise extends Promise<ShellPromiseResult> {
   text(): Promise<string>;
   json<T = any>(): Promise<T>;
@@ -37,16 +57,21 @@ export interface ShellPromise extends Promise<ShellPromiseResult> {
   env(variables: Record<string, string>): ShellPromise;
   cwd(directory: string): ShellPromise;
   allowHostExecutables(allowlist: Record<string, string>): ShellPromise;
+  allowLocalExecutables(allowlist: Record<string, string>): ShellPromise;
+  allowPackageScripts(names: string[]): ShellPromise;
+  allowNodeModulesBin(names: string[]): ShellPromise;
 }
 
 /** @deprecated Use `ShellOpts` instead. */
 export type ShellConfig = ShellOpts;
 
 /**
- * Wrapper over the napi `Shell` that applies the default host-executable
- * allowlist (node + npm) whenever the caller does not pass one explicitly.
- * An explicit `allowHostExecutables` — including `{}` to deny all host
- * executables — always wins.
+ * Wrapper over the napi `Shell` that applies the default allow-surfaces
+ * whenever the caller does not pass them explicitly:
+ * - `allowHostExecutables`: node + npm (absolute paths).
+ * - `allowPackageScripts`, `allowNodeModulesBin`, `allowLocalExecutables`:
+ *   empty (deny-by-default).
+ * Any explicit value — including `{}`/`[]` to deny — always wins.
  */
 class ShellWithDefaults extends NapiShell {
   constructor(opts?: ShellOpts) {
@@ -54,6 +79,12 @@ class ShellWithDefaults extends NapiShell {
       ...opts,
       allowHostExecutables:
         opts?.allowHostExecutables ?? defaultAllowHostExecutables,
+      allowLocalExecutables:
+        opts?.allowLocalExecutables ?? defaultAllowLocalExecutables,
+      allowPackageScripts:
+        opts?.allowPackageScripts ?? defaultAllowPackageScripts,
+      allowNodeModulesBin:
+        opts?.allowNodeModulesBin ?? defaultAllowNodeModulesBin,
     });
   }
 }
@@ -131,6 +162,30 @@ export class ShellCommandPromise implements ShellPromise {
     return this;
   }
 
+  allowLocalExecutables(allowlist: Record<string, string>): this {
+    this._localCfg.allowLocalExecutables = {
+      ...this._localCfg.allowLocalExecutables,
+      ...allowlist,
+    };
+    return this;
+  }
+
+  allowPackageScripts(names: string[]): this {
+    this._localCfg.allowPackageScripts = [
+      ...(this._localCfg.allowPackageScripts ?? []),
+      ...names,
+    ];
+    return this;
+  }
+
+  allowNodeModulesBin(names: string[]): this {
+    this._localCfg.allowNodeModulesBin = [
+      ...(this._localCfg.allowNodeModulesBin ?? []),
+      ...names,
+    ];
+    return this;
+  }
+
   async text(): Promise<string> {
     this.quiet();
     const res = await this;
@@ -171,6 +226,9 @@ export interface ShellFunction {
   nothrow(): void;
   throws(throwOnError: boolean): void;
   allowHostExecutables(allowlist?: Record<string, string>): Record<string, string> | null;
+  allowLocalExecutables(allowlist?: Record<string, string>): Record<string, string> | null;
+  allowPackageScripts(names?: string[]): string[] | null;
+  allowNodeModulesBin(names?: string[]): string[] | null;
   braces(pattern: string): string[];
   escape(s: string): string;
 }
@@ -210,6 +268,12 @@ $.nothrow = () => defaultShell.nothrow();
 $.throws = (throwOnError: boolean) => defaultShell.throws(throwOnError);
 $.allowHostExecutables = (allowlist?: Record<string, string>) =>
   defaultShell.allowHostExecutables(allowlist);
+$.allowLocalExecutables = (allowlist?: Record<string, string>) =>
+  defaultShell.allowLocalExecutables(allowlist);
+$.allowPackageScripts = (names?: string[]) =>
+  defaultShell.allowPackageScripts(names);
+$.allowNodeModulesBin = (names?: string[]) =>
+  defaultShell.allowNodeModulesBin(names);
 $.braces = (pattern: string) => braces(pattern);
 $.escape = (s: string) => escape(s);
 

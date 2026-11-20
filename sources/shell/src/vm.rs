@@ -8,6 +8,38 @@ use std::path::{Path, PathBuf};
 use crate::shell::ast::{CommandNode, LogicalOp, PipelineNode, PipelineSequence, RedirectOp};
 use crate::shell::builtins::{is_builtin, run_builtin};
 use crate::shell::process::{CommandOptions, EnvEntry, run_command};
+use crate::shell::parser::parse_shell_script;
+
+/// Maximum recursion depth when package scripts invoke other package scripts.
+/// Guards against `"scripts": { "a": "npm run a" }`-style self-referential loops.
+pub const MAX_SCRIPT_DEPTH: usize = 8;
+
+/// Execution context threaded through the whole pipeline evaluation.
+///
+/// Four allow-surfaces exist, all deny-by-default (except host executables,
+/// which the JS wrapper defaults to node + npm):
+///
+/// - `allow_host_executables`: command name -> absolute host executable path.
+/// - `allow_local_executables`: command name -> path relative to the shell cwd
+///   (absolute paths also accepted), resolved at run time. The target file
+///   must exist; it is spawned directly, so it gets full host access.
+/// - `allow_package_scripts`: package.json `scripts` names (or `"*"`) exposed
+///   as commands. Script bodies are parsed and executed **inside this shell
+///   VM** with the same allow-surfaces — they can never escape the sandbox.
+/// - `allow_node_modules_bin`: `node_modules/.bin` entry names (or `"*"`)
+///   exposed as commands. Resolved by walking up from cwd; spawned directly
+///   by the OS, so each allowed entry gets full host access.
+#[derive(Clone, Copy)]
+pub struct ExecContext<'a> {
+    pub cwd: &'a Path,
+    pub env: &'a HashMap<String, String>,
+    pub allow_host_executables: &'a HashMap<String, String>,
+    pub allow_local_executables: &'a HashMap<String, String>,
+    pub allow_package_scripts: &'a [String],
+    pub allow_node_modules_bin: &'a [String],
+    /// Nesting level of package-script execution (0 = top level).
+    pub depth: usize,
+}
 
 pub struct ShellExecutionHost {
     pub cwd: PathBuf,
@@ -82,26 +114,117 @@ pub struct ShellOutput {
     pub exit_code: i32,
 }
 
-/// Exit code and stderr produced when a command is not in the host-executable
-/// allowlist. 126 mirrors the shell convention for "command found but not
+/// Exit code and stderr produced when a command is not permitted by any
+/// allow-surface. 126 mirrors the shell convention for "command found but not
 /// executable".
 fn denied_output(command: &str) -> ShellOutput {
     ShellOutput {
         stdout: Vec::new(),
         stderr: format!(
-            "shell: {command}: host executable not allowed (missing from allowHostExecutables)\n"
+            "shell: {command}: host executable not allowed (missing from allowHostExecutables; \
+             also consider allowLocalExecutables, allowPackageScripts or allowNodeModulesBin)\n"
         )
         .into_bytes(),
         exit_code: 126,
     }
 }
 
-pub fn execute_pipeline_sequence(
-    sequence: &PipelineSequence,
-    cwd: &Path,
-    env_vars: &HashMap<String, String>,
-    allow_host_executables: &HashMap<String, String>,
-) -> ShellOutput {
+/// Walk up from `start` looking for the first existing `rel` path.
+fn find_up(start: &Path, rel: &Path) -> Option<PathBuf> {
+    let mut dir = Some(start.to_path_buf());
+    while let Some(d) = dir {
+        let candidate = d.join(rel);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+        dir = d.parent().map(Path::to_path_buf);
+    }
+    None
+}
+
+/// Read a script body from the nearest package.json walking up from cwd.
+fn read_package_script(cwd: &Path, name: &str) -> Option<String> {
+    let pkg_path = find_up(cwd, Path::new("package.json"))?;
+    let content = fs::read_to_string(pkg_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&content).ok()?;
+    value
+        .get("scripts")?
+        .get(name)?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Whether an allow list (script names or .bin names) permits `name`.
+/// The entry `"*"` permits everything.
+fn allow_list_permits(list: &[String], name: &str) -> bool {
+    list.iter().any(|s| s == "*" || s == name)
+}
+
+/// Resolve a `node_modules/.bin` entry by walking up from cwd.
+fn resolve_node_modules_bin(cwd: &Path, name: &str) -> Option<PathBuf> {
+    let bin_dir = find_up(cwd, Path::new("node_modules").join(".bin").as_path())?;
+    let mut candidates = vec![name.to_string()];
+    if cfg!(windows) {
+        candidates.push(format!("{name}.cmd"));
+        candidates.push(format!("{name}.exe"));
+    }
+    for candidate in candidates {
+        let p = bin_dir.join(&candidate);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Resolve an entry of `allow_local_executables` against the shell cwd.
+fn resolve_local_executable(cwd: &Path, path: &str) -> PathBuf {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    }
+}
+
+/// Execute a package.json script by parsing its body and running it inside
+/// this shell VM with the same allow-surfaces (recursion-depth guarded).
+fn run_package_script(name: &str, args: &[String], ctx: &ExecContext) -> ShellOutput {
+    if ctx.depth >= MAX_SCRIPT_DEPTH {
+        return ShellOutput {
+            stdout: Vec::new(),
+            stderr: format!(
+                "shell: {name}: package script nesting too deep (limit {MAX_SCRIPT_DEPTH})\n"
+            )
+            .into_bytes(),
+            exit_code: 1,
+        };
+    }
+    let Some(body) = read_package_script(ctx.cwd, name) else {
+        return denied_output(name);
+    };
+    // npm-style argument forwarding: `greet a b` runs the body with " a b" appended.
+    let script = if args.is_empty() {
+        body
+    } else {
+        format!("{body} {}", args.join(" "))
+    };
+    let seq = match parse_shell_script(&script) {
+        Ok(seq) => seq,
+        Err(e) => {
+            return ShellOutput {
+                stdout: Vec::new(),
+                stderr: format!("shell: {name}: failed to parse package script: {e}\n")
+                    .into_bytes(),
+                exit_code: 1,
+            };
+        }
+    };
+    let nested = ExecContext { depth: ctx.depth + 1, ..*ctx };
+    execute_pipeline_sequence(&seq, &nested)
+}
+
+pub fn execute_pipeline_sequence(sequence: &PipelineSequence, ctx: &ExecContext) -> ShellOutput {
     let mut last_stdout = Vec::new();
     let mut last_stderr = Vec::new();
     let mut last_exit_code = 0;
@@ -121,7 +244,7 @@ pub fn execute_pipeline_sequence(
             LogicalOp::Sequential => {}
         }
 
-        let output = execute_pipeline(pipeline, cwd, env_vars, allow_host_executables);
+        let output = execute_pipeline(pipeline, ctx);
         last_exit_code = output.exit_code;
         last_stdout = output.stdout;
         last_stderr = output.stderr;
@@ -134,12 +257,7 @@ pub fn execute_pipeline_sequence(
     }
 }
 
-fn execute_pipeline(
-    pipeline: &PipelineNode,
-    cwd: &Path,
-    env_vars: &HashMap<String, String>,
-    allow_host_executables: &HashMap<String, String>,
-) -> ShellOutput {
+fn execute_pipeline(pipeline: &PipelineNode, ctx: &ExecContext) -> ShellOutput {
     let mut current_stdin: Vec<u8> = Vec::new();
     let mut last_stdout = Vec::new();
     let mut last_stderr = Vec::new();
@@ -148,7 +266,7 @@ fn execute_pipeline(
     for (i, cmd) in pipeline.commands.iter().enumerate() {
         let is_last = i == pipeline.commands.len() - 1;
         let input = std::mem::take(&mut current_stdin);
-        let res = execute_command(cmd, input, cwd, env_vars, allow_host_executables);
+        let res = execute_command(cmd, input, ctx);
         last_exit = res.exit_code;
         if is_last {
             last_stdout = res.stdout;
@@ -170,10 +288,10 @@ fn execute_pipeline(
 fn execute_command(
     cmd: &CommandNode,
     mut stdin_data: Vec<u8>,
-    cwd: &Path,
-    env_vars: &HashMap<String, String>,
-    allow_host_executables: &HashMap<String, String>,
+    ctx: &ExecContext,
 ) -> ShellOutput {
+    let cwd = ctx.cwd;
+    let env_vars = ctx.env;
     if cmd.args.is_empty() {
         return ShellOutput {
             stdout: Vec::new(),
@@ -208,20 +326,110 @@ fn execute_command(
     let prog_name = &cmd.args[0];
     let args = &cmd.args[1..];
 
-    // Builtins always run; external commands must be allowlisted, and the
-    // allowlisted absolute path is what actually gets spawned.
+    // Resolution order:
+    //   1. shell builtins (always permitted)
+    //   2. allowHostExecutables (absolute host paths)
+    //   3. allowLocalExecutables (project-relative paths, resolved at run time)
+    //   4. allowPackageScripts / allowNodeModulesBin — script names take
+    //      precedence at the top level (they are exposed as commands), while
+    //      inside a package script body the .bin lookup comes first to match
+    //      `npm run` semantics where .bin is prepended to PATH.
+    // Anything else is denied with exit 126.
+    fn resolve_non_builtin(
+        prog_name: &str,
+        args: &[String],
+        stdin_data: &[u8],
+        effective_env: &HashMap<String, String>,
+        ctx: &ExecContext,
+    ) -> Option<(Vec<u8>, Vec<u8>, i32)> {
+        if let Some(executable) = ctx.allow_host_executables.get(prog_name) {
+            return Some(run_external(
+                executable,
+                args,
+                stdin_data,
+                ctx.cwd,
+                effective_env,
+            ));
+        }
+        if let Some(rel_path) = ctx.allow_local_executables.get(prog_name) {
+            let resolved = resolve_local_executable(ctx.cwd, rel_path);
+            if !resolved.is_file() {
+                return Some((
+                    Vec::new(),
+                    format!(
+                        "shell: {prog_name}: local executable not found at {}\n",
+                        resolved.display()
+                    )
+                    .into_bytes(),
+                    127,
+                ));
+            }
+            return Some(run_external(
+                &resolved.to_string_lossy(),
+                args,
+                stdin_data,
+                ctx.cwd,
+                effective_env,
+            ));
+        }
+        let script_first =
+            ctx.depth == 0 || !allow_list_permits(ctx.allow_node_modules_bin, prog_name);
+        if script_first {
+            if allow_list_permits(ctx.allow_package_scripts, prog_name)
+                && read_package_script(ctx.cwd, prog_name).is_some()
+            {
+                let out = run_package_script(prog_name, args, ctx);
+                return Some((out.stdout, out.stderr, out.exit_code));
+            }
+            if allow_list_permits(ctx.allow_node_modules_bin, prog_name) {
+                if let Some(bin_path) = resolve_node_modules_bin(ctx.cwd, prog_name) {
+                    return Some(run_external(
+                        &bin_path.to_string_lossy(),
+                        args,
+                        stdin_data,
+                        ctx.cwd,
+                        effective_env,
+                    ));
+                }
+            }
+        } else {
+            if let Some(bin_path) = resolve_node_modules_bin(ctx.cwd, prog_name) {
+                return Some(run_external(
+                    &bin_path.to_string_lossy(),
+                    args,
+                    stdin_data,
+                    ctx.cwd,
+                    effective_env,
+                ));
+            }
+            if allow_list_permits(ctx.allow_package_scripts, prog_name)
+                && read_package_script(ctx.cwd, prog_name).is_some()
+            {
+                let out = run_package_script(prog_name, args, ctx);
+                return Some((out.stdout, out.stderr, out.exit_code));
+            }
+        }
+        None
+    }
+
     let (mut stdout, mut stderr, exit_code) = if is_builtin(prog_name) {
         if let Some(res) = run_builtin(prog_name, args, &stdin_data, cwd) {
             (res.stdout, res.stderr, res.exit_code)
-        } else if let Some(executable) = allow_host_executables.get(prog_name.as_str()) {
-            run_external(executable, args, &stdin_data, cwd, &effective_env)
         } else {
-            return denied_output(prog_name);
+            resolve_non_builtin(prog_name, args, &stdin_data, &effective_env, ctx).unwrap_or_else(
+                || {
+                    let d = denied_output(prog_name);
+                    (d.stdout, d.stderr, d.exit_code)
+                },
+            )
         }
-    } else if let Some(executable) = allow_host_executables.get(prog_name.as_str()) {
-        run_external(executable, args, &stdin_data, cwd, &effective_env)
     } else {
-        return denied_output(prog_name);
+        resolve_non_builtin(prog_name, args, &stdin_data, &effective_env, ctx).unwrap_or_else(
+            || {
+                let d = denied_output(prog_name);
+                (d.stdout, d.stderr, d.exit_code)
+            },
+        )
     };
 
     // Process output redirections
@@ -343,28 +551,74 @@ mod tests {
     use super::*;
     use crate::shell::parser::parse_shell_script;
 
-    fn env() -> HashMap<String, String> {
-        std::env::vars().collect()
+    struct TestCtx {
+        cwd: PathBuf,
+        allow_host: HashMap<String, String>,
+        allow_local: HashMap<String, String>,
+        allow_scripts: Vec<String>,
+        allow_bin: Vec<String>,
     }
 
-    fn run(script: &str, allowlist: &HashMap<String, String>) -> ShellOutput {
-        let seq = parse_shell_script(script).unwrap();
-        execute_pipeline_sequence(&seq, Path::new("."), &env(), allowlist)
+    impl TestCtx {
+        fn new(cwd: &Path) -> Self {
+            Self {
+                cwd: cwd.to_path_buf(),
+                allow_host: HashMap::new(),
+                allow_local: HashMap::new(),
+                allow_scripts: Vec::new(),
+                allow_bin: Vec::new(),
+            }
+        }
+
+        fn run(&self, script: &str) -> ShellOutput {
+            let seq = parse_shell_script(script).unwrap();
+            let ctx = ExecContext {
+                cwd: &self.cwd,
+                env: &std::env::vars().collect(),
+                allow_host_executables: &self.allow_host,
+                allow_local_executables: &self.allow_local,
+                allow_package_scripts: &self.allow_scripts,
+                allow_node_modules_bin: &self.allow_bin,
+                depth: 0,
+            };
+            execute_pipeline_sequence(&seq, &ctx)
+        }
+    }
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("shell-vm-{}-{}", tag, std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[cfg(unix)]
+    fn write_exec(path: &Path, body: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        let mut f = fs::File::create(path).unwrap();
+        f.write_all(body.as_bytes()).unwrap();
+        drop(f);
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
     }
 
     #[test]
     fn allowlisted_absolute_path_runs() {
-        let mut allowlist = HashMap::new();
-        allowlist.insert("pod".to_string(), "/bin/echo".to_string());
-        let out = run("pod aliased", &allowlist);
+        let mut ctx = TestCtx::new(Path::new("."));
+        ctx.allow_host
+            .insert("pod".to_string(), "/bin/echo".to_string());
+        let out = ctx.run("pod aliased");
         assert_eq!(out.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "aliased");
     }
 
     #[test]
     fn non_allowlisted_command_denied() {
-        let allowlist = HashMap::new();
-        let out = run("pod aliased", &allowlist);
+        let ctx = TestCtx::new(Path::new("."));
+        let out = ctx.run("pod aliased");
         assert_eq!(out.exit_code, 126);
         assert!(String::from_utf8_lossy(&out.stderr).contains("not allowed"));
         assert!(out.stdout.is_empty());
@@ -372,28 +626,217 @@ mod tests {
 
     #[test]
     fn builtins_run_without_allowlist() {
-        let allowlist = HashMap::new();
-        let out = run("echo hello", &allowlist);
+        let ctx = TestCtx::new(Path::new("."));
+        let out = ctx.run("echo hello");
         assert_eq!(out.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
     }
 
     #[test]
     fn allowlist_maps_command_name_to_executable() {
-        let mut allowlist = HashMap::new();
+        let mut ctx = TestCtx::new(Path::new("."));
         // Command written as `greet` actually spawns /bin/echo.
-        allowlist.insert("greet".to_string(), "/bin/echo".to_string());
-        let out = run("greet mapped", &allowlist);
+        ctx.allow_host
+            .insert("greet".to_string(), "/bin/echo".to_string());
+        let out = ctx.run("greet mapped");
         assert_eq!(out.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "mapped");
     }
 
     #[test]
     fn denied_command_short_circuits_logical_and() {
-        let allowlist = HashMap::new();
-        let out = run("pod x && echo after", &allowlist);
+        let ctx = TestCtx::new(Path::new("."));
+        let out = ctx.run("pod x && echo after");
         assert_eq!(out.exit_code, 126);
         // `echo after` must not run because the denied command failed.
         assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    }
+
+    #[test]
+    fn package_script_runs_in_vm_with_args() {
+        let dir = temp_dir("script");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"t","scripts":{"greet":"echo script-body"}}"#,
+        )
+        .unwrap();
+        let mut ctx = TestCtx::new(&dir);
+        ctx.allow_scripts = vec!["greet".to_string()];
+        let out = ctx.run("greet extra");
+        assert_eq!(out.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            String::from_utf8_lossy(&out.stdout).trim(),
+            "script-body extra"
+        );
+    }
+
+    #[test]
+    fn package_script_body_cannot_escape_allowlist() {
+        let dir = temp_dir("script-escape");
+        // The script body tries to spawn a host command that is NOT allowlisted.
+        // Because scripts run inside the VM, this must still be denied (126).
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"t","scripts":{"evil":"/bin/echo pwned"}}"#,
+        )
+        .unwrap();
+        let mut ctx = TestCtx::new(&dir);
+        ctx.allow_scripts = vec!["evil".to_string()];
+        let out = ctx.run("evil");
+        assert_eq!(out.exit_code, 126);
+        assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    }
+
+    #[test]
+    fn package_script_not_in_allowlist_denied() {
+        let dir = temp_dir("script-deny");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"t","scripts":{"greet":"echo hi"}}"#,
+        )
+        .unwrap();
+        let ctx = TestCtx::new(&dir);
+        let out = ctx.run("greet");
+        assert_eq!(out.exit_code, 126);
+    }
+
+    #[test]
+    fn package_script_can_call_allowed_bin() {
+        let dir = temp_dir("script-bin");
+        #[cfg(unix)]
+        write_exec(
+            &dir.join("node_modules/.bin/hello"),
+            "#!/bin/sh\necho bin-hello\n",
+        );
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"t","scripts":{"all":"echo start && hello"}}"#,
+        )
+        .unwrap();
+        let mut ctx = TestCtx::new(&dir);
+        ctx.allow_scripts = vec!["all".to_string()];
+        ctx.allow_bin = vec!["hello".to_string()];
+        let out = ctx.run("all");
+        assert_eq!(out.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        // Only the last command's stdout is captured: `hello` is last, so the
+        // .bin tool's output must appear (proving it ran inside the script).
+        assert!(String::from_utf8_lossy(&out.stdout).contains("bin-hello"));
+    }
+
+    #[test]
+    fn package_script_recursion_is_depth_limited() {
+        let dir = temp_dir("script-loop");
+        fs::write(
+            dir.join("package.json"),
+            r#"{"name":"t","scripts":{"self":"self"}}"#,
+        )
+        .unwrap();
+        let mut ctx = TestCtx::new(&dir);
+        ctx.allow_scripts = vec!["self".to_string()];
+        let out = ctx.run("self");
+        // Must terminate with an error instead of hanging.
+        assert_ne!(out.exit_code, 0);
+    }
+
+    #[test]
+    fn node_modules_bin_runs_when_allowed() {
+        let dir = temp_dir("bin");
+        #[cfg(unix)]
+        write_exec(
+            &dir.join("node_modules/.bin/mytool"),
+            "#!/bin/sh\necho bin-tool\n",
+        );
+        let mut ctx = TestCtx::new(&dir);
+        ctx.allow_bin = vec!["mytool".to_string()];
+        let out = ctx.run("mytool");
+        assert_eq!(out.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "bin-tool");
+    }
+
+    #[test]
+    fn node_modules_bin_denied_by_default() {
+        let dir = temp_dir("bin-deny");
+        #[cfg(unix)]
+        write_exec(
+            &dir.join("node_modules/.bin/mytool"),
+            "#!/bin/sh\necho bin-tool\n",
+        );
+        let ctx = TestCtx::new(&dir);
+        let out = ctx.run("mytool");
+        assert_eq!(out.exit_code, 126);
+        assert!(out.stdout.is_empty());
+    }
+
+    #[test]
+    fn node_modules_bin_wildcard_allows() {
+        let dir = temp_dir("bin-star");
+        #[cfg(unix)]
+        write_exec(
+            &dir.join("node_modules/.bin/anything"),
+            "#!/bin/sh\necho wildcard-tool\n",
+        );
+        let mut ctx = TestCtx::new(&dir);
+        ctx.allow_bin = vec!["*".to_string()];
+        let out = ctx.run("anything");
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "wildcard-tool");
+    }
+
+    #[test]
+    fn node_modules_bin_resolved_from_nested_cwd() {
+        let dir = temp_dir("bin-nested");
+        #[cfg(unix)]
+        write_exec(
+            &dir.join("node_modules/.bin/upstream"),
+            "#!/bin/sh\necho from-root\n",
+        );
+        let nested = dir.join("packages/app/src");
+        fs::create_dir_all(&nested).unwrap();
+        let mut ctx = TestCtx::new(&nested);
+        ctx.allow_bin = vec!["upstream".to_string()];
+        let out = ctx.run("upstream");
+        assert_eq!(out.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "from-root");
+    }
+
+    #[test]
+    fn local_executable_runs_when_allowed() {
+        let dir = temp_dir("local");
+        #[cfg(unix)]
+        write_exec(
+            &dir.join("scripts/dev.sh"),
+            "#!/bin/sh\necho local-tool\n",
+        );
+        let mut ctx = TestCtx::new(&dir);
+        ctx.allow_local
+            .insert("tool".to_string(), "scripts/dev.sh".to_string());
+        let out = ctx.run("tool");
+        assert_eq!(out.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "local-tool");
+    }
+
+    #[test]
+    fn local_executable_missing_file_reports_127() {
+        let dir = temp_dir("local-missing");
+        let mut ctx = TestCtx::new(&dir);
+        ctx.allow_local
+            .insert("tool".to_string(), "scripts/nope.sh".to_string());
+        let out = ctx.run("tool");
+        assert_eq!(out.exit_code, 127);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not found"));
+    }
+
+    #[test]
+    fn local_executable_not_in_allowlist_denied() {
+        let dir = temp_dir("local-deny");
+        #[cfg(unix)]
+        write_exec(
+            &dir.join("scripts/dev.sh"),
+            "#!/bin/sh\necho local-tool\n",
+        );
+        let ctx = TestCtx::new(&dir);
+        let out = ctx.run("tool");
+        assert_eq!(out.exit_code, 126);
+        assert!(out.stdout.is_empty());
     }
 }

@@ -24,11 +24,21 @@ use crate::shell::vm::execute_pipeline_sequence;
 
 /// Options for the `Shell` constructor and per-command `run` calls.
 ///
-/// `allow_host_executables` is the allowlist of host executables the shell may
-/// spawn. Keys are command names as written in a script; values MUST be
-/// absolute paths to the real executable (e.g. `/opt/local/usr/container` or
-/// `process.execPath` for node). Commands not present in the map are denied
-/// with exit code 126; shell builtins are unaffected.
+/// All allow-surfaces are deny-by-default. The JS wrapper additionally
+/// defaults `allowHostExecutables` to node + npm (absolute paths) when the
+/// caller does not pass one explicitly.
+///
+/// - `allow_host_executables`: command name -> absolute host executable path.
+///   Commands not present are denied with exit code 126; builtins unaffected.
+/// - `allow_local_executables`: command name -> project-relative executable
+///   path (absolute also accepted), resolved against the shell cwd at run
+///   time. The target is spawned directly, so it gets full host access.
+/// - `allow_package_scripts`: package.json `scripts` names (or `"*"`) exposed
+///   as shell commands. Script bodies are parsed and executed inside the
+///   shell VM with the same allow-surfaces — they cannot escape the sandbox.
+/// - `allow_node_modules_bin`: `node_modules/.bin` entry names (or `"*"`)
+///   exposed as shell commands, resolved by walking up from cwd. Entries are
+///   spawned directly by the OS, so each allowed name gets full host access.
 #[napi(object)]
 #[derive(Clone, Default)]
 pub struct ShellOpts {
@@ -36,6 +46,9 @@ pub struct ShellOpts {
     pub env: Option<HashMap<String, String>>,
     pub nothrow: Option<bool>,
     pub allow_host_executables: Option<HashMap<String, String>>,
+    pub allow_local_executables: Option<HashMap<String, String>>,
+    pub allow_package_scripts: Option<Vec<String>>,
+    pub allow_node_modules_bin: Option<Vec<String>>,
 }
 
 /// Reject any non-absolute executable path in an allowlist.
@@ -127,13 +140,49 @@ impl Shell {
         }
     }
 
+    /// Get or replace the local-executable allowlist. Keys are command names;
+    /// values are paths relative to the shell cwd (absolute also accepted).
+    #[napi]
+    pub fn allow_local_executables(
+        &self,
+        allowlist: Option<HashMap<String, String>>,
+    ) -> Option<HashMap<String, String>> {
+        let mut cfg = self.config.lock().unwrap();
+        if let Some(map) = allowlist {
+            cfg.allow_local_executables = Some(map.clone());
+        }
+        cfg.allow_local_executables.clone()
+    }
+
+    /// Get or replace the package.json script allowlist. Script names (or
+    /// `"*"`) are exposed as shell commands and executed inside the shell VM.
+    #[napi]
+    pub fn allow_package_scripts(&self, names: Option<Vec<String>>) -> Option<Vec<String>> {
+        let mut cfg = self.config.lock().unwrap();
+        if let Some(n) = names {
+            cfg.allow_package_scripts = Some(n.clone());
+        }
+        cfg.allow_package_scripts.clone()
+    }
+
+    /// Get or replace the `node_modules/.bin` allowlist. Entry names (or
+    /// `"*"`) are exposed as shell commands and spawned directly.
+    #[napi]
+    pub fn allow_node_modules_bin(&self, names: Option<Vec<String>>) -> Option<Vec<String>> {
+        let mut cfg = self.config.lock().unwrap();
+        if let Some(n) = names {
+            cfg.allow_node_modules_bin = Some(n.clone());
+        }
+        cfg.allow_node_modules_bin.clone()
+    }
+
     #[napi]
     pub fn run(
         &self,
         script: String,
         local_cfg: Option<ShellOpts>,
     ) -> Result<ShellPromiseResult> {
-        let (cwd, env_map, nothrow, allowlist) = {
+        let (cwd, env_map, nothrow, allowlist, local_exec, scripts, bins) = {
             let base = self.config.lock().unwrap();
             let cwd = local_cfg
                 .as_ref()
@@ -165,13 +214,37 @@ impl Shell {
                 allowlist.extend(loc);
             }
 
-            (cwd, env_map, nothrow, allowlist)
+            let mut local_exec = base.allow_local_executables.clone().unwrap_or_default();
+            if let Some(loc) = local_cfg.as_ref().and_then(|c| c.allow_local_executables.clone()) {
+                local_exec.extend(loc);
+            }
+
+            let mut scripts = base.allow_package_scripts.clone().unwrap_or_default();
+            if let Some(loc) = local_cfg.as_ref().and_then(|c| c.allow_package_scripts.clone()) {
+                scripts.extend(loc);
+            }
+
+            let mut bins = base.allow_node_modules_bin.clone().unwrap_or_default();
+            if let Some(loc) = local_cfg.as_ref().and_then(|c| c.allow_node_modules_bin.clone()) {
+                bins.extend(loc);
+            }
+
+            (cwd, env_map, nothrow, allowlist, local_exec, scripts, bins)
         };
 
         let seq =
             parse_shell_script(&script).map_err(|e| napi::Error::new(Status::GenericFailure, e))?;
 
-        let output = execute_pipeline_sequence(&seq, &cwd, &env_map, &allowlist);
+        let ctx = crate::shell::vm::ExecContext {
+            cwd: &cwd,
+            env: &env_map,
+            allow_host_executables: &allowlist,
+            allow_local_executables: &local_exec,
+            allow_package_scripts: &scripts,
+            allow_node_modules_bin: &bins,
+            depth: 0,
+        };
+        let output = execute_pipeline_sequence(&seq, &ctx);
 
         if output.exit_code != 0 && !nothrow {
             let stderr_str = String::from_utf8_lossy(&output.stderr);
@@ -263,5 +336,45 @@ mod tests {
             ..Default::default()
         };
         assert!(Shell::new(Some(opts)).is_ok());
+    }
+
+    #[test]
+    fn shell_opts_default_deny_surfaces() {
+        let shell = Shell::new(None).unwrap();
+        assert!(shell
+            .allow_package_scripts(None)
+            .unwrap_or_default()
+            .is_empty());
+        assert!(shell
+            .allow_node_modules_bin(None)
+            .unwrap_or_default()
+            .is_empty());
+        assert!(shell
+            .allow_local_executables(None)
+            .unwrap_or_default()
+            .is_empty());
+    }
+
+    #[test]
+    fn shell_allowlist_setters_round_trip() {
+        let shell = Shell::new(None).unwrap();
+        shell.allow_package_scripts(Some(vec!["build".to_string(), "*".to_string()]));
+        assert_eq!(
+            shell.allow_package_scripts(None).unwrap(),
+            vec!["build".to_string(), "*".to_string()]
+        );
+        shell.allow_node_modules_bin(Some(vec!["vitest".to_string()]));
+        assert_eq!(
+            shell.allow_node_modules_bin(None).unwrap(),
+            vec!["vitest".to_string()]
+        );
+        shell.allow_local_executables(Some(HashMap::from([(
+            "tool".to_string(),
+            "scripts/tool.sh".to_string(),
+        )])));
+        assert_eq!(
+            shell.allow_local_executables(None).unwrap().get("tool"),
+            Some(&"scripts/tool.sh".to_string())
+        );
     }
 }
