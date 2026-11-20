@@ -9,3 +9,6 @@ target/
 dist/
 
 .vitest/
+
+# napi CLI filesystem-reconciliation staging leftovers
+.napi-rs-filesystem-reconciliation*
