@@ -7,6 +7,7 @@
 //!   `&>> out`, `2>&1`, `1>&2`
 //! - command sequences: `&&`, `||`, `;`, newline
 //! - environment prefixes: `FOO=bar cmd`
+//! - comments beginning with `#` at a word boundary
 //! - quoting: single quotes (fully literal), double quotes (with `\$`, `` \` ``,
 //!   `\"` and `\\` escapes), backslash escapes outside quotes
 //! - line continuations: a backslash immediately before a newline
@@ -19,7 +20,6 @@
 //! - variable expansion (`$VAR`, `${VAR}`)
 //! - command substitution (`$(...)`, backticks)
 //! - globbing (`*`, `?`, `[...]`)
-//! - comments (`#` is an ordinary character)
 //! - background jobs (`&`), subshells, brace expansion, job control
 //!
 //! # Strictness
@@ -160,6 +160,19 @@ impl ShellParser {
         }
     }
 
+    /// Skip blank lines and comments where a command could start.
+    fn skip_leading_comments(&mut self) {
+        loop {
+            self.skip_whitespace();
+            if self.peek() != Some('#') {
+                break;
+            }
+            while !matches!(self.peek(), None | Some('\n')) {
+                self.advance();
+            }
+        }
+    }
+
     /// Match a literal string at the current position; advance on success.
     /// Allocation-free (the previous implementation built a `String` per
     /// comparison, which happened for every token of every script).
@@ -177,7 +190,7 @@ impl ShellParser {
 
     fn parse_sequence(&mut self) -> Result<PipelineSequence, String> {
         let mut pipelines = Vec::new();
-        self.skip_whitespace();
+        self.skip_leading_comments();
         if self.pos >= self.chars.len() {
             return Ok(PipelineSequence { pipelines });
         }
@@ -206,7 +219,7 @@ impl ShellParser {
                 return Err(self.unexpected_token_error());
             };
 
-            self.skip_whitespace();
+            self.skip_leading_comments();
             if self.pos >= self.chars.len() {
                 match op {
                     // `cmd &&` with nothing after it is a syntax error, but a
@@ -240,7 +253,8 @@ impl ShellParser {
             self.skip_blanks();
             if self.peek() == Some('|') && self.peek_next() != Some('|') {
                 self.advance(); // consume '|'
-                self.skip_blanks();
+                // A pipeline may continue on the next line.
+                self.skip_leading_comments();
                 let cmd = self.parse_command()?;
                 if is_empty_command(&cmd) {
                     return Err(
@@ -271,8 +285,37 @@ impl ShellParser {
 
             // Terminating operators. `&` only terminates when it does not
             // start a `&>` / `&>>` redirection.
-            if ch == '|' || ch == ';' || ch == '\n' || (ch == '&' && self.peek_next() != Some('>')) {
+            if ch == '|' || ch == ';' || ch == '\n' || (ch == '&' && self.peek_next() != Some('>'))
+            {
                 break;
+            }
+
+            if ch == '#' {
+                while !matches!(self.peek(), None | Some('\n')) {
+                    self.advance();
+                }
+                break;
+            }
+
+            // Numbered descriptors outside the supported set must not turn
+            // into an argument followed by a different redirection.
+            if ch.is_ascii_digit() {
+                let end = self.pos
+                    + self.chars[self.pos..]
+                        .iter()
+                        .take_while(|c| c.is_ascii_digit())
+                        .count();
+                if matches!(self.chars.get(end), Some('<' | '>')) {
+                    let supported = matches!(self.chars[self.pos..end], ['1'] | ['2']);
+                    if !supported
+                        || (ch == '1' && self.chars[end] == '<')
+                        || (ch == '2' && self.chars[end] == '<')
+                    {
+                        return Err(
+                            "Syntax error: unsupported file descriptor redirection".to_string()
+                        );
+                    }
+                }
             }
 
             // Redirections
@@ -282,14 +325,27 @@ impl ShellParser {
             }
 
             // Word / argument
-            let Some(word) = self.parse_word()? else {
+            let word_start = self.pos;
+            let Some((word, assignment_name_end)) = self.parse_word()? else {
                 break;
             };
 
+            if !parsed_any_arg
+                && assignment_name_end.is_none()
+                && self.chars[word_start..self.pos]
+                    .iter()
+                    .copied()
+                    .eq(word.chars())
+                && is_unsupported_reserved_word(&word)
+            {
+                return Err(format!(
+                    "Syntax error: reserved word '{word}' is not supported"
+                ));
+            }
+
             // Check if this is an env assignment prefix (e.g. FOO=bar) before command
-            if !parsed_any_arg && is_env_assignment(&word) {
-                let parts: Vec<&str> = word.splitn(2, '=').collect();
-                env_vars.push((parts[0].to_string(), parts[1].to_string()));
+            if !parsed_any_arg && let Some(end) = assignment_name_end {
+                env_vars.push((word[..end].to_string(), word[end + 1..].to_string()));
             } else {
                 parsed_any_arg = true;
                 args.push(word);
@@ -312,15 +368,9 @@ impl ShellParser {
         } else if self.match_str("&>") {
             matched_op = Some(RedirectOp::BothTruncate);
         } else if self.match_str("2>&1") {
-            return Ok(Some(Redirection {
-                op: RedirectOp::StderrToStdout,
-                target: String::new(),
-            }));
+            return Ok(Some(Redirection::StderrToStdout));
         } else if self.match_str("1>&2") {
-            return Ok(Some(Redirection {
-                op: RedirectOp::StdoutToStderr,
-                target: String::new(),
-            }));
+            return Ok(Some(Redirection::StdoutToStderr));
         } else if self.match_str("2>>") {
             matched_op = Some(RedirectOp::StderrAppend);
         } else if self.match_str("2>") {
@@ -335,13 +385,13 @@ impl ShellParser {
 
         if let Some(op) = matched_op {
             self.skip_blanks();
-            let Some(target) = self.parse_word()? else {
+            let Some((target, _)) = self.parse_word()? else {
                 return Err("Syntax error: expected redirect target".to_string());
             };
             if target.is_empty() {
                 return Err("Syntax error: empty redirect target".to_string());
             }
-            return Ok(Some(Redirection { op, target }));
+            return Ok(Some(Redirection::File { op, target }));
         }
 
         self.pos = start;
@@ -354,18 +404,21 @@ impl ShellParser {
     /// input or a shell metacharacter). An empty `Some("")` is a *valid* word:
     /// it comes from an explicit empty quoted string (`''`) and must be
     /// preserved as an argument.
-    fn parse_word(&mut self) -> Result<Option<String>, String> {
+    fn parse_word(&mut self) -> Result<Option<(String, Option<usize>)>, String> {
         match self.peek() {
             None => return Ok(None),
             Some(first)
                 if first.is_whitespace() || matches!(first, '|' | ';' | '&' | '<' | '>') =>
             {
-                return Ok(None)
+                return Ok(None);
             }
             Some(_) => {}
         }
 
         let mut result = String::new();
+        // Only an unquoted, unescaped name and equals sign form an assignment.
+        let mut assignment_candidate = true;
+        let mut assignment_name_end = None;
 
         loop {
             let Some(ch) = self.peek() else {
@@ -374,8 +427,37 @@ impl ShellParser {
             if ch.is_whitespace() || matches!(ch, '|' | ';' | '&' | '<' | '>') {
                 break;
             }
+            if matches!(ch, '(' | ')') {
+                return Err("Syntax error: subshell syntax is not supported".to_string());
+            }
+            if matches!(ch, '*' | '?' | '[' | '`')
+                || (ch == '$'
+                    && matches!(
+                        self.peek_next(),
+                        Some(
+                            '$'
+                            | '('
+                            | '{'
+                            | '@'
+                            | '#'
+                            | '?'
+                            | '!'
+                            | '*'
+                            | '-'
+                            | '_'
+                            | '0'..='9'
+                            | 'A'..='Z'
+                            | 'a'..='z',
+                        )
+                    ))
+            {
+                return Err("Syntax error: expansion syntax is not supported".to_string());
+            }
 
             if ch == '\'' {
+                if assignment_name_end.is_none() {
+                    assignment_candidate = false;
+                }
                 // Single quotes: preserve literal contents verbatim.
                 self.advance();
                 let mut closed = false;
@@ -390,6 +472,9 @@ impl ShellParser {
                     return Err("Syntax error: unterminated single quote".to_string());
                 }
             } else if ch == '"' {
+                if assignment_name_end.is_none() {
+                    assignment_candidate = false;
+                }
                 // Double quotes: handle escape characters.
                 self.advance();
                 let mut closed = false;
@@ -412,6 +497,31 @@ impl ShellParser {
                             None => result.push('\\'),
                         }
                     } else {
+                        if c == '`'
+                            || (c == '$'
+                                && matches!(
+                                    self.peek(),
+                                    Some(
+                                        '$'
+                                        | '('
+                                        | '{'
+                                        | '@'
+                                        | '#'
+                                        | '?'
+                                        | '!'
+                                        | '*'
+                                        | '-'
+                                        | '_'
+                                        | '0'..='9'
+                                        | 'A'..='Z'
+                                        | 'a'..='z',
+                                    )
+                                ))
+                        {
+                            return Err(
+                                "Syntax error: expansion syntax is not supported".to_string()
+                            );
+                        }
                         result.push(c);
                     }
                 }
@@ -419,6 +529,9 @@ impl ShellParser {
                     return Err("Syntax error: unterminated double quote".to_string());
                 }
             } else if ch == '\\' {
+                if assignment_name_end.is_none() {
+                    assignment_candidate = false;
+                }
                 self.advance();
                 match self.advance() {
                     // Line continuation: the backslash-newline pair vanishes.
@@ -429,12 +542,23 @@ impl ShellParser {
                     }
                 }
             } else {
+                if assignment_candidate && assignment_name_end.is_none() {
+                    if ch == '=' {
+                        if is_env_name(&result) {
+                            assignment_name_end = Some(result.len());
+                        } else {
+                            assignment_candidate = false;
+                        }
+                    } else if !(ch.is_ascii_alphanumeric() || ch == '_') {
+                        assignment_candidate = false;
+                    }
+                }
                 result.push(ch);
                 self.advance();
             }
         }
 
-        Ok(Some(result))
+        Ok(Some((result, assignment_name_end)))
     }
 
     /// Error for input the sequence parser cannot interpret.
@@ -445,7 +569,10 @@ impl ShellParser {
         if ch == '&' {
             return "Syntax error: background operator '&' is not supported".to_string();
         }
-        format!("Syntax error: unexpected token '{ch}' at position {}", self.pos)
+        format!(
+            "Syntax error: unexpected token '{ch}' at position {}",
+            self.pos
+        )
     }
 
     /// Error for a command that turned out to have no content.
@@ -461,19 +588,31 @@ impl ShellParser {
     }
 }
 
-fn is_env_assignment(s: &str) -> bool {
-    if let Some(idx) = s.find('=') {
-        if idx == 0 {
-            return false;
-        }
-        let var_name = &s[..idx];
-        var_name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && !var_name.chars().next().unwrap().is_ascii_digit()
-    } else {
-        false
-    }
+fn is_env_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_unsupported_reserved_word(word: &str) -> bool {
+    matches!(
+        word,
+        "if" | "then"
+            | "else"
+            | "elif"
+            | "fi"
+            | "for"
+            | "while"
+            | "until"
+            | "do"
+            | "done"
+            | "case"
+            | "esac"
+            | "in"
+            | "!"
+            | "{"
+            | "}"
+    )
 }
 
 #[cfg(test)]
@@ -505,9 +644,14 @@ mod tests {
         let cmd = &seq.pipelines[0].1.commands[0];
         assert_eq!(cmd.args, vec!["echo", "hello"]);
         assert_eq!(cmd.redirects.len(), 2);
-        assert_eq!(cmd.redirects[0].op, RedirectOp::OutputTruncate);
-        assert_eq!(cmd.redirects[0].target, "out.txt");
-        assert_eq!(cmd.redirects[1].op, RedirectOp::StderrToStdout);
+        assert_eq!(
+            cmd.redirects[0],
+            Redirection::File {
+                op: RedirectOp::OutputTruncate,
+                target: "out.txt".into()
+            }
+        );
+        assert_eq!(cmd.redirects[1], Redirection::StderrToStdout);
     }
 
     // --- `&>` / `&>>` used to be unreachable: `&` terminated the command
@@ -519,13 +663,23 @@ mod tests {
         let cmd = &seq.pipelines[0].1.commands[0];
         assert_eq!(cmd.args, vec!["echo", "hi"]);
         assert_eq!(cmd.redirects.len(), 1);
-        assert_eq!(cmd.redirects[0].op, RedirectOp::BothTruncate);
-        assert_eq!(cmd.redirects[0].target, "out.txt");
+        assert_eq!(
+            cmd.redirects[0],
+            Redirection::File {
+                op: RedirectOp::BothTruncate,
+                target: "out.txt".into()
+            }
+        );
 
         let seq = parse_shell_script("echo hi &>> out.txt").unwrap();
         let cmd = &seq.pipelines[0].1.commands[0];
-        assert_eq!(cmd.redirects[0].op, RedirectOp::BothAppend);
-        assert_eq!(cmd.redirects[0].target, "out.txt");
+        assert_eq!(
+            cmd.redirects[0],
+            Redirection::File {
+                op: RedirectOp::BothAppend,
+                target: "out.txt".into()
+            }
+        );
     }
 
     #[test]
@@ -630,7 +784,13 @@ mod tests {
         let cmd = &seq.pipelines[0].1.commands[0];
         assert!(cmd.args.is_empty());
         assert_eq!(cmd.redirects.len(), 1);
-        assert_eq!(cmd.redirects[0].op, RedirectOp::OutputTruncate);
+        assert_eq!(
+            cmd.redirects[0],
+            Redirection::File {
+                op: RedirectOp::OutputTruncate,
+                target: "out.txt".into()
+            }
+        );
     }
 
     #[test]
@@ -651,5 +811,83 @@ mod tests {
             ]
         );
         assert_eq!(cmd.args, vec!["echo", "hi"]);
+    }
+
+    #[test]
+    fn quoted_or_escaped_assignment_name_is_a_command() {
+        for script in [
+            r#""FOO=bar" echo hi"#,
+            r"FOO\=bar echo hi",
+            r"F'O'O=bar echo hi",
+        ] {
+            let seq = parse_shell_script(script).unwrap();
+            let cmd = &seq.pipelines[0].1.commands[0];
+            assert!(cmd.env_vars.is_empty(), "{script}");
+            assert_eq!(cmd.args, ["FOO=bar", "echo", "hi"], "{script}");
+        }
+        let cmd = &parse_shell_script("FOO='bar' echo hi").unwrap().pipelines[0]
+            .1
+            .commands[0];
+        assert_eq!(cmd.env_vars, [("FOO".into(), "bar".into())]);
+    }
+
+    #[test]
+    fn pipeline_continues_after_newline() {
+        let seq = parse_shell_script("echo hi |\n  cat").unwrap();
+        assert_eq!(seq.pipelines[0].1.commands.len(), 2);
+        assert!(parse_shell_script("echo hi |\n").is_err());
+    }
+
+    #[test]
+    fn unsupported_lexical_constructs_are_rejected() {
+        for script in ["echo 3>out", "cat 0<input", "echo foo(bar)", "(echo hi)"] {
+            assert!(parse_shell_script(script).is_err(), "{script}");
+        }
+        assert!(parse_shell_script("echo '(literal)'").is_ok());
+    }
+
+    #[test]
+    fn comments_follow_posix_word_boundaries() {
+        let seq = parse_shell_script("# header\necho foo#bar # tail\n# another\necho end").unwrap();
+        assert_eq!(seq.pipelines.len(), 2);
+        assert_eq!(seq.pipelines[0].1.commands[0].args, ["echo", "foo#bar"]);
+        assert_eq!(seq.pipelines[1].1.commands[0].args, ["echo", "end"]);
+        assert!(
+            parse_shell_script("  # comment only")
+                .unwrap()
+                .pipelines
+                .is_empty()
+        );
+        assert_eq!(
+            parse_shell_script("echo '#literal'").unwrap().pipelines[0]
+                .1
+                .commands[0]
+                .args[1],
+            "#literal"
+        );
+        assert_eq!(
+            parse_shell_script("echo hi | # comment\n cat")
+                .unwrap()
+                .pipelines[0]
+                .1
+                .commands
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn unsupported_posix_forms_fail_explicitly() {
+        for script in [
+            "if true; then echo yes; fi",
+            "for x in a; do echo x; done",
+            "echo $HOME",
+            "echo \"$HOME\"",
+            "echo *.rs",
+            "echo `pwd`",
+        ] {
+            assert!(parse_shell_script(script).is_err(), "{script}");
+        }
+        assert!(parse_shell_script("echo '$HOME' '*.rs' \\*").is_ok());
     }
 }

@@ -20,10 +20,7 @@ import {
  */
 export const defaultAllowHostExecutables: Record<string, string> = {
   node: process.execPath,
-  npm: join(
-    dirname(process.execPath),
-    process.platform === "win32" ? "npm.cmd" : "npm",
-  ),
+  npm: join(dirname(process.execPath), process.platform === "win32" ? "npm.cmd" : "npm"),
 };
 
 /**
@@ -47,6 +44,8 @@ export const defaultAllowNodeModulesBin: string[] = [];
 export const defaultAllowLocalExecutables: Record<string, string> = {};
 
 export interface ShellPromise extends Promise<ShellPromiseResult> {
+  stdin(input: Response | Blob | ArrayBuffer | ArrayBufferView | string): ShellPromise;
+  stdout(target: WritableStream<Uint8Array> | Uint8Array): ShellPromise;
   text(): Promise<string>;
   json<T = any>(): Promise<T>;
   lines(): AsyncIterable<string>;
@@ -77,25 +76,23 @@ class ShellWithDefaults extends NapiShell {
   constructor(opts?: ShellOpts) {
     super({
       ...opts,
-      allowHostExecutables:
-        opts?.allowHostExecutables ?? defaultAllowHostExecutables,
-      allowLocalExecutables:
-        opts?.allowLocalExecutables ?? defaultAllowLocalExecutables,
-      allowPackageScripts:
-        opts?.allowPackageScripts ?? defaultAllowPackageScripts,
-      allowNodeModulesBin:
-        opts?.allowNodeModulesBin ?? defaultAllowNodeModulesBin,
+      allowHostExecutables: opts?.allowHostExecutables ?? defaultAllowHostExecutables,
+      allowLocalExecutables: opts?.allowLocalExecutables ?? defaultAllowLocalExecutables,
+      allowPackageScripts: opts?.allowPackageScripts ?? defaultAllowPackageScripts,
+      allowNodeModulesBin: opts?.allowNodeModulesBin ?? defaultAllowNodeModulesBin,
     });
   }
 }
 
 export class ShellCommandPromise implements ShellPromise {
   private _promise?: Promise<ShellPromiseResult>;
-  private _shell: Shell;
+  private _shell: ShellWithDefaults;
   private _script: string;
   private _localCfg: ShellOpts = {};
+  private _input?: Response | Blob | ArrayBuffer | ArrayBufferView | string;
+  private _output?: WritableStream<Uint8Array> | Uint8Array;
 
-  constructor(shell: Shell, script: string, localCfg: ShellOpts = {}) {
+  constructor(shell: ShellWithDefaults, script: string, localCfg: ShellOpts = {}) {
     this._shell = shell;
     this._script = script;
     this._localCfg = { ...localCfg };
@@ -109,8 +106,45 @@ export class ShellCommandPromise implements ShellPromise {
   }
 
   private async execute(): Promise<ShellPromiseResult> {
-    const res = await this._shell.run(this._script, this._localCfg);
+    const input = this._input;
+    let bytes: Uint8Array | undefined;
+    if (typeof input === "string") bytes = new TextEncoder().encode(input);
+    else if (input instanceof Response || input instanceof Blob)
+      bytes = new Uint8Array(await input.arrayBuffer());
+    else if (input instanceof ArrayBuffer) bytes = new Uint8Array(input);
+    else if (ArrayBuffer.isView(input))
+      bytes = new Uint8Array(input.buffer, input.byteOffset, input.byteLength);
+    const res = await this._shell.run(this._script, {
+      ...this._localCfg,
+      stdin: bytes === undefined ? undefined : Buffer.from(bytes),
+    });
+    if (this._output) {
+      const output = new Uint8Array(res.stdout);
+      if (this._output instanceof Uint8Array) {
+        if (this._output.byteLength < output.byteLength)
+          throw new RangeError("stdout target is too small");
+        this._output.set(output);
+      } else {
+        const writer = this._output.getWriter();
+        try {
+          await writer.write(output);
+          await writer.close();
+        } finally {
+          writer.releaseLock();
+        }
+      }
+    }
     return res;
+  }
+
+  stdin(input: Response | Blob | ArrayBuffer | ArrayBufferView | string): this {
+    this._input = input;
+    return this;
+  }
+
+  stdout(target: WritableStream<Uint8Array> | Uint8Array): this {
+    this._output = target;
+    return this;
   }
 
   then<TResult1 = ShellPromiseResult, TResult2 = never>(
@@ -171,18 +205,12 @@ export class ShellCommandPromise implements ShellPromise {
   }
 
   allowPackageScripts(names: string[]): this {
-    this._localCfg.allowPackageScripts = [
-      ...(this._localCfg.allowPackageScripts ?? []),
-      ...names,
-    ];
+    this._localCfg.allowPackageScripts = [...(this._localCfg.allowPackageScripts ?? []), ...names];
     return this;
   }
 
   allowNodeModulesBin(names: string[]): this {
-    this._localCfg.allowNodeModulesBin = [
-      ...(this._localCfg.allowNodeModulesBin ?? []),
-      ...names,
-    ];
+    this._localCfg.allowNodeModulesBin = [...(this._localCfg.allowNodeModulesBin ?? []), ...names];
     return this;
   }
 
@@ -270,10 +298,8 @@ $.allowHostExecutables = (allowlist?: Record<string, string>) =>
   defaultShell.allowHostExecutables(allowlist);
 $.allowLocalExecutables = (allowlist?: Record<string, string>) =>
   defaultShell.allowLocalExecutables(allowlist);
-$.allowPackageScripts = (names?: string[]) =>
-  defaultShell.allowPackageScripts(names);
-$.allowNodeModulesBin = (names?: string[]) =>
-  defaultShell.allowNodeModulesBin(names);
+$.allowPackageScripts = (names?: string[]) => defaultShell.allowPackageScripts(names);
+$.allowNodeModulesBin = (names?: string[]) => defaultShell.allowNodeModulesBin(names);
 $.braces = (pattern: string) => braces(pattern);
 $.escape = (s: string) => escape(s);
 

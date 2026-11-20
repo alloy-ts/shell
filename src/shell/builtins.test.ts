@@ -76,6 +76,9 @@ describe("Shell Builtin Commands", () => {
     // cat
     expect(shell.exec("cat test.txt").stdout.toString().trim()).toBe("contents");
 
+    expect(shell.run("cp test.txt copy.txt").exitCode).toBe(0);
+    expect(fs.readFileSync(path.join(tmpDir, "copy.txt"), "utf8")).toBe("contents");
+
     // ls
     expect(shell.exec("ls").stdout.toString().trim()).toContain("test.txt");
 

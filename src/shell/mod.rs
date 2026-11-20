@@ -23,7 +23,7 @@ use crate::shell::child_process::{
     Allowances, build_script, context, exec_result, resolve_cwd_env, sync_stdout,
 };
 use crate::shell::parser::{SYNTAX_ERROR_EXIT, parse_shell_script};
-use crate::shell::vm::execute_pipeline_sequence;
+use crate::shell::vm::execute_pipeline_sequence_with_input;
 
 /// Options for the `Shell` constructor and per-command `run` calls.
 ///
@@ -43,11 +43,13 @@ use crate::shell::vm::execute_pipeline_sequence;
 ///   exposed as shell commands, resolved by walking up from cwd. Entries are
 ///   spawned directly by the OS, so each allowed name gets full host access.
 #[napi(object)]
-#[derive(Clone, Default)]
+#[derive(Default)]
 pub struct ShellOpts {
     pub cwd: Option<String>,
     pub env: Option<HashMap<String, String>>,
     pub nothrow: Option<bool>,
+    /// Bytes supplied as stdin to each top-level pipeline.
+    pub stdin: Option<Buffer>,
     pub allow_host_executables: Option<HashMap<String, String>>,
     pub allow_local_executables: Option<HashMap<String, String>>,
     pub allow_package_scripts: Option<Vec<String>>,
@@ -180,12 +182,8 @@ impl Shell {
     }
 
     #[napi]
-    pub fn run(
-        &self,
-        script: String,
-        local_cfg: Option<ShellOpts>,
-    ) -> Result<ShellPromiseResult> {
-        let (cwd, env_map, nothrow, allowlist, local_exec, scripts, bins) = {
+    pub fn run(&self, script: String, local_cfg: Option<ShellOpts>) -> Result<ShellPromiseResult> {
+        let (cwd, env_map, nothrow, allowlist, local_exec, scripts, bins, stdin) = {
             let base = self.config.lock().unwrap();
             let cwd = local_cfg
                 .as_ref()
@@ -211,28 +209,48 @@ impl Shell {
                 .unwrap_or(false);
 
             let mut allowlist = base.allow_host_executables.clone().unwrap_or_default();
-            if let Some(loc) = local_cfg.as_ref().and_then(|c| c.allow_host_executables.clone()) {
+            if let Some(loc) = local_cfg
+                .as_ref()
+                .and_then(|c| c.allow_host_executables.clone())
+            {
                 validate_allow_host_executables(&loc)
                     .map_err(|e| napi::Error::new(Status::GenericFailure, e))?;
                 allowlist.extend(loc);
             }
 
             let mut local_exec = base.allow_local_executables.clone().unwrap_or_default();
-            if let Some(loc) = local_cfg.as_ref().and_then(|c| c.allow_local_executables.clone()) {
+            if let Some(loc) = local_cfg
+                .as_ref()
+                .and_then(|c| c.allow_local_executables.clone())
+            {
                 local_exec.extend(loc);
             }
 
             let mut scripts = base.allow_package_scripts.clone().unwrap_or_default();
-            if let Some(loc) = local_cfg.as_ref().and_then(|c| c.allow_package_scripts.clone()) {
+            if let Some(loc) = local_cfg
+                .as_ref()
+                .and_then(|c| c.allow_package_scripts.clone())
+            {
                 scripts.extend(loc);
             }
 
             let mut bins = base.allow_node_modules_bin.clone().unwrap_or_default();
-            if let Some(loc) = local_cfg.as_ref().and_then(|c| c.allow_node_modules_bin.clone()) {
+            if let Some(loc) = local_cfg
+                .as_ref()
+                .and_then(|c| c.allow_node_modules_bin.clone())
+            {
                 bins.extend(loc);
             }
 
-            (cwd, env_map, nothrow, allowlist, local_exec, scripts, bins)
+            let stdin = local_cfg
+                .as_ref()
+                .and_then(|c| c.stdin.as_ref())
+                .or(base.stdin.as_ref())
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default();
+            (
+                cwd, env_map, nothrow, allowlist, local_exec, scripts, bins, stdin,
+            )
         };
 
         // A syntax error is a failed command, not an API error: report it the
@@ -248,7 +266,7 @@ impl Shell {
                     allow_node_modules_bin: &bins,
                     depth: 0,
                 };
-                execute_pipeline_sequence(&seq, &ctx)
+                execute_pipeline_sequence_with_input(&seq, &ctx, &stdin)
             }
             Err(e) => crate::shell::vm::ShellOutput {
                 stdout: Vec::new(),
@@ -288,11 +306,8 @@ impl Shell {
             let cfg = self.config.lock().unwrap();
             (cfg.cwd.clone(), cfg.env.clone())
         };
-        let (cwd, env_map) = resolve_cwd_env(
-            options.as_ref(),
-            base_cwd.as_deref(),
-            base_env.as_ref(),
-        );
+        let (cwd, env_map) =
+            resolve_cwd_env(options.as_ref(), base_cwd.as_deref(), base_env.as_ref());
         let allow = {
             let cfg = self.config.lock().unwrap();
             Allowances {
@@ -307,7 +322,11 @@ impl Shell {
     }
 
     #[napi]
-    pub fn exec(&self, command: String, options: Option<ChildProcessOptions>) -> Result<ExecResult> {
+    pub fn exec(
+        &self,
+        command: String,
+        options: Option<ChildProcessOptions>,
+    ) -> Result<ExecResult> {
         self.child_run(&command, options)
     }
 
@@ -440,18 +459,24 @@ mod tests {
     #[test]
     fn shell_opts_default_deny_surfaces() {
         let shell = Shell::new(None).unwrap();
-        assert!(shell
-            .allow_package_scripts(None)
-            .unwrap_or_default()
-            .is_empty());
-        assert!(shell
-            .allow_node_modules_bin(None)
-            .unwrap_or_default()
-            .is_empty());
-        assert!(shell
-            .allow_local_executables(None)
-            .unwrap_or_default()
-            .is_empty());
+        assert!(
+            shell
+                .allow_package_scripts(None)
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(
+            shell
+                .allow_node_modules_bin(None)
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(
+            shell
+                .allow_local_executables(None)
+                .unwrap_or_default()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -489,15 +514,16 @@ mod tests {
         let shell = Shell::new(Some(opts)).unwrap();
         let res = shell.exec("pod via-instance".to_string(), None).unwrap();
         assert_eq!(res.exit_code, 0);
-        assert_eq!(String::from_utf8_lossy(res.stdout.as_ref()).trim(), "via-instance");
+        assert_eq!(
+            String::from_utf8_lossy(res.stdout.as_ref()).trim(),
+            "via-instance"
+        );
     }
 
     #[test]
     fn shell_exec_instance_denies_non_allowlisted() {
         let shell = Shell::new(None).unwrap();
-        let res = shell
-            .exec("/bin/echo escape".to_string(), None)
-            .unwrap();
+        let res = shell.exec("/bin/echo escape".to_string(), None).unwrap();
         assert_eq!(res.exit_code, 126);
         assert!(res.stdout.as_ref().is_empty());
     }
@@ -506,7 +532,11 @@ mod tests {
     fn shell_exec_file_quotes_args_and_uses_allowlist() {
         let shell = Shell::new(None).unwrap();
         let res = shell
-            .exec_file("echo".to_string(), Some(vec!["hello world".to_string()]), None)
+            .exec_file(
+                "echo".to_string(),
+                Some(vec!["hello world".to_string()]),
+                None,
+            )
             .unwrap();
         assert_eq!(res.exit_code, 0);
         assert_eq!(

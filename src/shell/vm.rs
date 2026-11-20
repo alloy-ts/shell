@@ -5,10 +5,12 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::shell::ast::{CommandNode, LogicalOp, PipelineNode, PipelineSequence, RedirectOp};
+use crate::shell::ast::{
+    CommandNode, LogicalOp, PipelineNode, PipelineSequence, RedirectOp, Redirection,
+};
 use crate::shell::builtins::{is_builtin, run_builtin};
-use crate::shell::process::{CommandOptions, EnvEntry, run_command};
 use crate::shell::parser::{SYNTAX_ERROR_EXIT, parse_shell_script};
+use crate::shell::process::{CommandOptions, EnvEntry, run_command};
 
 /// Maximum recursion depth when package scripts invoke other package scripts.
 /// Guards against `"scripts": { "a": "npm run a" }`-style self-referential loops.
@@ -228,11 +230,22 @@ fn run_package_script(name: &str, args: &[String], ctx: &ExecContext) -> ShellOu
             };
         }
     };
-    let nested = ExecContext { depth: ctx.depth + 1, ..*ctx };
+    let nested = ExecContext {
+        depth: ctx.depth + 1,
+        ..*ctx
+    };
     execute_pipeline_sequence(&seq, &nested)
 }
 
 pub fn execute_pipeline_sequence(sequence: &PipelineSequence, ctx: &ExecContext) -> ShellOutput {
+    execute_pipeline_sequence_with_input(sequence, ctx, &[])
+}
+
+pub fn execute_pipeline_sequence_with_input(
+    sequence: &PipelineSequence,
+    ctx: &ExecContext,
+    input: &[u8],
+) -> ShellOutput {
     let mut last_stdout = Vec::new();
     let mut last_stderr = Vec::new();
     let mut last_exit_code = 0;
@@ -252,7 +265,7 @@ pub fn execute_pipeline_sequence(sequence: &PipelineSequence, ctx: &ExecContext)
             LogicalOp::Sequential => {}
         }
 
-        let output = execute_pipeline(pipeline, ctx);
+        let output = execute_pipeline(pipeline, ctx, input);
         last_exit_code = output.exit_code;
         // A shell concatenates the output of every command in a sequence —
         // only the last *stage of a pipeline* produces that pipeline's stdout.
@@ -267,8 +280,8 @@ pub fn execute_pipeline_sequence(sequence: &PipelineSequence, ctx: &ExecContext)
     }
 }
 
-fn execute_pipeline(pipeline: &PipelineNode, ctx: &ExecContext) -> ShellOutput {
-    let mut current_stdin: Vec<u8> = Vec::new();
+fn execute_pipeline(pipeline: &PipelineNode, ctx: &ExecContext, input: &[u8]) -> ShellOutput {
+    let mut current_stdin: Vec<u8> = input.to_vec();
     let mut last_stdout = Vec::new();
     let mut last_stderr = Vec::new();
     let mut last_exit = 0;
@@ -295,11 +308,7 @@ fn execute_pipeline(pipeline: &PipelineNode, ctx: &ExecContext) -> ShellOutput {
     }
 }
 
-fn execute_command(
-    cmd: &CommandNode,
-    mut stdin_data: Vec<u8>,
-    ctx: &ExecContext,
-) -> ShellOutput {
+fn execute_command(cmd: &CommandNode, mut stdin_data: Vec<u8>, ctx: &ExecContext) -> ShellOutput {
     let cwd = ctx.cwd;
     let env_vars = ctx.env;
     if cmd.args.is_empty() {
@@ -331,8 +340,12 @@ fn execute_command(
 
     // Process input redirections `<`
     for redir in &cmd.redirects {
-        if matches!(redir.op, RedirectOp::Input) {
-            let file_path = match redir_path(cwd, &redir.target) {
+        if let Redirection::File {
+            op: RedirectOp::Input,
+            target,
+        } = redir
+        {
+            let file_path = match redir_path(cwd, target) {
                 Ok(p) => p,
                 Err(out) => return out,
             };
@@ -482,14 +495,20 @@ fn apply_redirects(
     mut stderr: Vec<u8>,
 ) -> Result<(Vec<u8>, Vec<u8>), ShellOutput> {
     for redir in &cmd.redirects {
-        match redir.op {
-            RedirectOp::OutputTruncate => {
-                let file_path = redir_path(cwd, &redir.target)?;
+        match redir {
+            Redirection::File {
+                op: RedirectOp::OutputTruncate,
+                target,
+            } => {
+                let file_path = redir_path(cwd, target)?;
                 let _ = fs::write(file_path, &stdout);
                 stdout.clear();
             }
-            RedirectOp::OutputAppend => {
-                let file_path = redir_path(cwd, &redir.target)?;
+            Redirection::File {
+                op: RedirectOp::OutputAppend,
+                target,
+            } => {
+                let file_path = redir_path(cwd, target)?;
                 if let Ok(mut f) = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -500,13 +519,19 @@ fn apply_redirects(
                 }
                 stdout.clear();
             }
-            RedirectOp::StderrTruncate => {
-                let file_path = redir_path(cwd, &redir.target)?;
+            Redirection::File {
+                op: RedirectOp::StderrTruncate,
+                target,
+            } => {
+                let file_path = redir_path(cwd, target)?;
                 let _ = fs::write(file_path, &stderr);
                 stderr.clear();
             }
-            RedirectOp::StderrAppend => {
-                let file_path = redir_path(cwd, &redir.target)?;
+            Redirection::File {
+                op: RedirectOp::StderrAppend,
+                target,
+            } => {
+                let file_path = redir_path(cwd, target)?;
                 if let Ok(mut f) = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -517,16 +542,22 @@ fn apply_redirects(
                 }
                 stderr.clear();
             }
-            RedirectOp::BothTruncate => {
-                let file_path = redir_path(cwd, &redir.target)?;
+            Redirection::File {
+                op: RedirectOp::BothTruncate,
+                target,
+            } => {
+                let file_path = redir_path(cwd, target)?;
                 let mut combined = stdout.clone();
                 combined.extend_from_slice(&stderr);
                 let _ = fs::write(file_path, combined);
                 stdout.clear();
                 stderr.clear();
             }
-            RedirectOp::BothAppend => {
-                let file_path = redir_path(cwd, &redir.target)?;
+            Redirection::File {
+                op: RedirectOp::BothAppend,
+                target,
+            } => {
+                let file_path = redir_path(cwd, target)?;
                 if let Ok(mut f) = fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -539,15 +570,18 @@ fn apply_redirects(
                 stdout.clear();
                 stderr.clear();
             }
-            RedirectOp::StderrToStdout => {
+            Redirection::StderrToStdout => {
                 stdout.extend_from_slice(&stderr);
                 stderr.clear();
             }
-            RedirectOp::StdoutToStderr => {
+            Redirection::StdoutToStderr => {
                 stderr.extend_from_slice(&stdout);
                 stdout.clear();
             }
-            RedirectOp::Input => {}
+            Redirection::File {
+                op: RedirectOp::Input,
+                ..
+            } => {}
         }
     }
 
@@ -594,6 +628,47 @@ fn run_external(
 mod tests {
     use super::*;
     use crate::shell::parser::parse_shell_script;
+
+    #[cfg(unix)]
+    #[test]
+    fn supported_literal_commands_match_dash() {
+        if std::process::Command::new("dash")
+            .arg("-c")
+            .arg(":")
+            .output()
+            .is_err()
+        {
+            eprintln!("dash unavailable; skipping POSIX reference comparison");
+            return;
+        }
+        let dir = temp_dir("posix-subset");
+        let ctx = TestCtx::new(&dir);
+        for script in [
+            "echo hello",
+            "echo 'a b'",
+            "echo one | cat",
+            "false || echo yes",
+            "true && echo yes",
+            "echo foo#bar # comment",
+            "echo a; echo b",
+            "echo hi | # comment\n cat",
+        ] {
+            let reference = std::process::Command::new("dash")
+                .arg("-c")
+                .arg(script)
+                .current_dir(&dir)
+                .output()
+                .expect("dash is required for the POSIX comparison test");
+            let actual = ctx.run(script);
+            assert_eq!(actual.stdout, reference.stdout, "stdout: {script}");
+            assert_eq!(actual.stderr, reference.stderr, "stderr: {script}");
+            assert_eq!(
+                actual.exit_code,
+                reference.status.code().unwrap(),
+                "status: {script}"
+            );
+        }
+    }
 
     struct TestCtx {
         cwd: PathBuf,
@@ -707,7 +782,12 @@ mod tests {
         let mut ctx = TestCtx::new(&dir);
         ctx.allow_scripts = vec!["greet".to_string()];
         let out = ctx.run("greet extra");
-        assert_eq!(out.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.exit_code,
+            0,
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert_eq!(
             String::from_utf8_lossy(&out.stdout).trim(),
             "script-body extra"
@@ -761,7 +841,12 @@ mod tests {
         ctx.allow_scripts = vec!["all".to_string()];
         ctx.allow_bin = vec!["hello".to_string()];
         let out = ctx.run("all");
-        assert_eq!(out.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.exit_code,
+            0,
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         // The script body is `echo start && hello`; both commands contribute
         // to the output, and the .bin tool's output proves it ran inside the
         // script.
@@ -795,7 +880,12 @@ mod tests {
         let mut ctx = TestCtx::new(&dir);
         ctx.allow_bin = vec!["mytool".to_string()];
         let out = ctx.run("mytool");
-        assert_eq!(out.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.exit_code,
+            0,
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "bin-tool");
     }
 
@@ -841,7 +931,12 @@ mod tests {
         let mut ctx = TestCtx::new(&nested);
         ctx.allow_bin = vec!["upstream".to_string()];
         let out = ctx.run("upstream");
-        assert_eq!(out.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.exit_code,
+            0,
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "from-root");
     }
 
@@ -849,15 +944,17 @@ mod tests {
     fn local_executable_runs_when_allowed() {
         let dir = temp_dir("local");
         #[cfg(unix)]
-        write_exec(
-            &dir.join("scripts/dev.sh"),
-            "#!/bin/sh\necho local-tool\n",
-        );
+        write_exec(&dir.join("scripts/dev.sh"), "#!/bin/sh\necho local-tool\n");
         let mut ctx = TestCtx::new(&dir);
         ctx.allow_local
             .insert("tool".to_string(), "scripts/dev.sh".to_string());
         let out = ctx.run("tool");
-        assert_eq!(out.exit_code, 0, "stderr: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(
+            out.exit_code,
+            0,
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "local-tool");
     }
 
@@ -876,10 +973,7 @@ mod tests {
     fn local_executable_not_in_allowlist_denied() {
         let dir = temp_dir("local-deny");
         #[cfg(unix)]
-        write_exec(
-            &dir.join("scripts/dev.sh"),
-            "#!/bin/sh\necho local-tool\n",
-        );
+        write_exec(&dir.join("scripts/dev.sh"), "#!/bin/sh\necho local-tool\n");
         let ctx = TestCtx::new(&dir);
         let out = ctx.run("tool");
         assert_eq!(out.exit_code, 126);
