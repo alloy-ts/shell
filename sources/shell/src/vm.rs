@@ -7,8 +7,7 @@ use std::path::{Path, PathBuf};
 
 use crate::shell::ast::{CommandNode, LogicalOp, PipelineNode, PipelineSequence, RedirectOp};
 use crate::shell::builtins::{is_builtin, run_builtin};
-use crate::shell::parser::parse_shell_script;
-use crate::shell::process::{CommandOptions, EnvEntry, outcome_from_command_result, run_command};
+use crate::shell::process::{CommandOptions, EnvEntry, run_command};
 
 pub struct ShellExecutionHost {
     pub cwd: PathBuf,
@@ -83,73 +82,17 @@ pub struct ShellOutput {
     pub exit_code: i32,
 }
 
-/// Resolve a command name through the configured executable aliases.
-///
-/// Alias values are either a literal path or a `$(command)` expression. The
-/// latter is evaluated via `run_command` with the shell's cwd/env and its
-/// trimmed stdout becomes the executable. On failure the original name is
-/// returned so a broken alias cannot silently change the command.
-pub fn resolve_executable_alias(
-    program: &str,
-    aliases: &HashMap<String, String>,
-    cwd: &Path,
-    env: &HashMap<String, String>,
-) -> String {
-    let Some(value) = aliases.get(program) else {
-        return program.to_string();
-    };
-    let value = value.trim();
-    if value.is_empty() {
-        return program.to_string();
-    }
-    if let Some(inner) = value.strip_prefix("$(").and_then(|s| s.strip_suffix(')')) {
-        return eval_command_substitution(inner, cwd, env).unwrap_or_else(|| program.to_string());
-    }
-    value.to_string()
-}
-
-fn eval_command_substitution(
-    command: &str,
-    cwd: &Path,
-    env: &HashMap<String, String>,
-) -> Option<String> {
-    let seq = parse_shell_script(command).ok()?;
-    let args = &seq.pipelines.first()?.1.commands.first()?.args;
-    let program = args.first()?.clone();
-    let cmd_args = args[1..].to_vec();
-    if program.is_empty() {
-        return None;
-    }
-
-    let env_entries = env
-        .iter()
-        .map(|(name, value)| EnvEntry {
-            name: name.clone(),
-            value: value.clone(),
-        })
-        .collect();
-
-    let result = run_command(CommandOptions {
-        program,
-        args: Some(cmd_args),
-        cwd: Some(cwd.to_string_lossy().into_owned()),
-        env: Some(env_entries),
-        input: None,
-        timeout_ms: None,
-        cleanup_timeout_ms: Some(5000.0),
-        limits: None,
-    })
-    .ok()?;
-
-    let (stdout, _stderr, exit_code) = outcome_from_command_result(result);
-    if exit_code != 0 {
-        return None;
-    }
-    let resolved = String::from_utf8_lossy(&stdout).trim().to_string();
-    if resolved.is_empty() {
-        None
-    } else {
-        Some(resolved)
+/// Exit code and stderr produced when a command is not in the host-executable
+/// allowlist. 126 mirrors the shell convention for "command found but not
+/// executable".
+fn denied_output(command: &str) -> ShellOutput {
+    ShellOutput {
+        stdout: Vec::new(),
+        stderr: format!(
+            "shell: {command}: host executable not allowed (missing from allowHostExecutables)\n"
+        )
+        .into_bytes(),
+        exit_code: 126,
     }
 }
 
@@ -157,7 +100,7 @@ pub fn execute_pipeline_sequence(
     sequence: &PipelineSequence,
     cwd: &Path,
     env_vars: &HashMap<String, String>,
-    aliases: &HashMap<String, String>,
+    allow_host_executables: &HashMap<String, String>,
 ) -> ShellOutput {
     let mut last_stdout = Vec::new();
     let mut last_stderr = Vec::new();
@@ -178,7 +121,7 @@ pub fn execute_pipeline_sequence(
             LogicalOp::Sequential => {}
         }
 
-        let output = execute_pipeline(pipeline, cwd, env_vars, aliases);
+        let output = execute_pipeline(pipeline, cwd, env_vars, allow_host_executables);
         last_exit_code = output.exit_code;
         last_stdout = output.stdout;
         last_stderr = output.stderr;
@@ -195,7 +138,7 @@ fn execute_pipeline(
     pipeline: &PipelineNode,
     cwd: &Path,
     env_vars: &HashMap<String, String>,
-    aliases: &HashMap<String, String>,
+    allow_host_executables: &HashMap<String, String>,
 ) -> ShellOutput {
     let mut current_stdin: Vec<u8> = Vec::new();
     let mut last_stdout = Vec::new();
@@ -205,7 +148,7 @@ fn execute_pipeline(
     for (i, cmd) in pipeline.commands.iter().enumerate() {
         let is_last = i == pipeline.commands.len() - 1;
         let input = std::mem::take(&mut current_stdin);
-        let res = execute_command(cmd, input, cwd, env_vars, aliases);
+        let res = execute_command(cmd, input, cwd, env_vars, allow_host_executables);
         last_exit = res.exit_code;
         if is_last {
             last_stdout = res.stdout;
@@ -229,7 +172,7 @@ fn execute_command(
     mut stdin_data: Vec<u8>,
     cwd: &Path,
     env_vars: &HashMap<String, String>,
-    aliases: &HashMap<String, String>,
+    allow_host_executables: &HashMap<String, String>,
 ) -> ShellOutput {
     if cmd.args.is_empty() {
         return ShellOutput {
@@ -262,19 +205,23 @@ fn execute_command(
         }
     }
 
-    let resolved = resolve_executable_alias(&cmd.args[0], aliases, cwd, &effective_env);
-    let prog_name = resolved.as_str();
+    let prog_name = &cmd.args[0];
     let args = &cmd.args[1..];
 
-    // Check builtins first
+    // Builtins always run; external commands must be allowlisted, and the
+    // allowlisted absolute path is what actually gets spawned.
     let (mut stdout, mut stderr, exit_code) = if is_builtin(prog_name) {
         if let Some(res) = run_builtin(prog_name, args, &stdin_data, cwd) {
             (res.stdout, res.stderr, res.exit_code)
+        } else if let Some(executable) = allow_host_executables.get(prog_name.as_str()) {
+            run_external(executable, args, &stdin_data, cwd, &effective_env)
         } else {
-            run_external(prog_name, args, &stdin_data, cwd, &effective_env)
+            return denied_output(prog_name);
         }
+    } else if let Some(executable) = allow_host_executables.get(prog_name.as_str()) {
+        run_external(executable, args, &stdin_data, cwd, &effective_env)
     } else {
-        run_external(prog_name, args, &stdin_data, cwd, &effective_env)
+        return denied_output(prog_name);
     };
 
     // Process output redirections
@@ -394,51 +341,59 @@ fn run_external(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shell::parser::parse_shell_script;
 
     fn env() -> HashMap<String, String> {
         std::env::vars().collect()
     }
 
-    #[test]
-    fn alias_literal_path() {
-        let mut aliases = HashMap::new();
-        aliases.insert("pod".to_string(), "opt/local/usr/container".to_string());
-        let resolved = resolve_executable_alias("pod", &aliases, Path::new("."), &env());
-        assert_eq!(resolved, "opt/local/usr/container");
+    fn run(script: &str, allowlist: &HashMap<String, String>) -> ShellOutput {
+        let seq = parse_shell_script(script).unwrap();
+        execute_pipeline_sequence(&seq, Path::new("."), &env(), allowlist)
     }
 
     #[test]
-    fn alias_command_substitution() {
-        let mut aliases = HashMap::new();
-        aliases.insert("pod".to_string(), "$(echo opt/local/usr/container)".to_string());
-        let resolved = resolve_executable_alias("pod", &aliases, Path::new("."), &env());
-        assert_eq!(resolved, "opt/local/usr/container");
-    }
-
-    #[test]
-    fn alias_missing_command_falls_back() {
-        let aliases = HashMap::new();
-        let resolved = resolve_executable_alias("pod", &aliases, Path::new("."), &env());
-        assert_eq!(resolved, "pod");
-    }
-
-    #[test]
-    fn alias_broken_substitution_falls_back() {
-        let mut aliases = HashMap::new();
-        aliases.insert(
-            "pod".to_string(),
-            "$(definitely_not_a_real_command_xyz)".to_string(),
-        );
-        let resolved = resolve_executable_alias("pod", &aliases, Path::new("."), &env());
-        assert_eq!(resolved, "pod");
-    }
-
-    #[test]
-    fn alias_applies_in_pipeline() {
-        let mut aliases = HashMap::new();
-        aliases.insert("pod".to_string(), "$(echo /bin/echo)".to_string());
-        let seq = parse_shell_script("pod aliased").unwrap();
-        let out = execute_pipeline_sequence(&seq, Path::new("."), &env(), &aliases);
+    fn allowlisted_absolute_path_runs() {
+        let mut allowlist = HashMap::new();
+        allowlist.insert("pod".to_string(), "/bin/echo".to_string());
+        let out = run("pod aliased", &allowlist);
+        assert_eq!(out.exit_code, 0);
         assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "aliased");
+    }
+
+    #[test]
+    fn non_allowlisted_command_denied() {
+        let allowlist = HashMap::new();
+        let out = run("pod aliased", &allowlist);
+        assert_eq!(out.exit_code, 126);
+        assert!(String::from_utf8_lossy(&out.stderr).contains("not allowed"));
+        assert!(out.stdout.is_empty());
+    }
+
+    #[test]
+    fn builtins_run_without_allowlist() {
+        let allowlist = HashMap::new();
+        let out = run("echo hello", &allowlist);
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hello");
+    }
+
+    #[test]
+    fn allowlist_maps_command_name_to_executable() {
+        let mut allowlist = HashMap::new();
+        // Command written as `greet` actually spawns /bin/echo.
+        allowlist.insert("greet".to_string(), "/bin/echo".to_string());
+        let out = run("greet mapped", &allowlist);
+        assert_eq!(out.exit_code, 0);
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "mapped");
+    }
+
+    #[test]
+    fn denied_command_short_circuits_logical_and() {
+        let allowlist = HashMap::new();
+        let out = run("pod x && echo after", &allowlist);
+        assert_eq!(out.exit_code, 126);
+        // `echo after` must not run because the denied command failed.
+        assert!(String::from_utf8_lossy(&out.stdout).is_empty());
     }
 }

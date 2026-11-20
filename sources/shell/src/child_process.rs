@@ -49,6 +49,9 @@ pub fn exec(command: String, options: Option<ChildProcessOptions>) -> Result<Exe
 
     let seq =
         parse_shell_script(&command).map_err(|e| napi::Error::new(Status::GenericFailure, e))?;
+    // The standalone exec API has no ShellOpts, so no host executables are
+    // allowlisted here: only shell builtins can run through the VM pipeline.
+    // Use execFile/spawn for direct, unrestricted process execution.
     let out = execute_pipeline_sequence(&seq, &cwd, &env_map, &HashMap::new());
 
     Ok(ExecResult {

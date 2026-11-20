@@ -63,16 +63,32 @@ describe("Bun-compatible Shell ($)", () => {
     expect(status).toContain("git_dir:");
   });
 
-  test("ShellOpts executableAliases: literal path", () => {
-    const shell = new Shell({ executableAliases: { pod: "/bin/echo" } });
+  test("ShellOpts allowHostExecutables: absolute path allowlist", () => {
+    const shell = new Shell({ allowHostExecutables: { pod: "/bin/echo" } });
     const res = shell.run("pod aliased");
     expect(res.stdout.toString().trim()).toBe("aliased");
   });
 
-  test("ShellOpts executableAliases: $(which ...) substitution", () => {
-    const shell = new Shell({ executableAliases: { pod: "$(which echo)" } });
-    const res = shell.run("pod aliased");
-    expect(res.stdout.toString().trim()).toBe("aliased");
+  test("ShellOpts allowHostExecutables: relative paths rejected", () => {
+    expect(
+      () =>
+        new Shell({
+          allowHostExecutables: { pod: "opt/local/usr/container" },
+        }),
+    ).toThrow(/absolute path/);
+  });
+
+  test("default Shell allows node from process.execPath", () => {
+    const shell = new Shell();
+    const res = shell.run(`node -e "console.log(1 + 1)"`);
+    expect(res.stdout.toString().trim()).toBe("2");
+  });
+
+  test("default Shell denies non-allowlisted host executables", () => {
+    const shell = new Shell();
+    const res = shell.run("podman --version", { nothrow: true });
+    expect(res.exitCode).toBe(126);
+    expect(res.stderr.toString()).toContain("not allowed");
   });
 });
 
